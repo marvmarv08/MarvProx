@@ -1,0 +1,1912 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 69781d4..69fe894 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -7,6 +7,8 @@ file(GLOB GTPROXY_INCLUDE_FILES
+     core/*.hpp
+     core/handlers/*.hpp
+     event/*.hpp
++    inventory/*.hpp
++    ui/*.hpp
+     item/*.hpp
+     network/*.hpp
+     packet/*.hpp
+@@ -24,6 +26,8 @@ file(GLOB GTPROXY_SOURCE_FILES
+     command/*.cpp
+     core/*.cpp
+     core/handlers/*.cpp
++    inventory/*.cpp
++    ui/*.cpp
+     item/*.cpp
+     network/*.cpp
+     packet/*.cpp
+@@ -123,3 +127,7 @@ foreach (script_file ${SCRIPT_FILES} ${SCRIPT_SUBDIR_FILES})
+         "$<TARGET_FILE_DIR:${PROJECT_NAME}>/scripts/${script_name}"
+         COMMENT "Copying ${script_name} to $<TARGET_FILE_DIR:${PROJECT_NAME}>/scripts/")
+ endforeach ()
++
++if(WIN32)
++    target_link_libraries(GTProxy_core PUBLIC user32 gdi32)
++endif()
+diff --git a/src/core/connection_policy.hpp b/src/core/connection_policy.hpp
+new file mode 100644
+index 0000000..5b11a1a
+--- /dev/null
++++ b/src/core/connection_policy.hpp
+@@ -0,0 +1,43 @@
++#pragma once
++#include <charconv>
++#include <string>
++#include <string_view>
++#include <stdexcept>
++namespace core {
++enum class RuntimeMode { OfflineSmoke, ReadOnlyConnection };
++class ConnectionPolicy {
++public:
++    ConnectionPolicy()=default;
++    static ConnectionPolicy read_only(std::string hostname,int timeout) {
++        if(!official_hostname(hostname) || timeout<1 || timeout>3600) throw std::invalid_argument{"Connection settings invalid"};
++        return ConnectionPolicy{std::move(hostname),timeout};
++    }
++    static bool official_hostname(std::string_view host) {
++        return host=="www.growtopia1.com" || host=="www.growtopia2.com" || host=="growtopia1.com" || host=="growtopia2.com";
++    }
++    bool allow_upstream() const {return mode_==RuntimeMode::ReadOnlyConnection;}
++    const std::string& hostname() const {return hostname_;}
++    int timeout_seconds() const {return timeout_;}
++    bool permits_endpoint(std::string_view host,int port) const {return allow_upstream() && port>0 && port<=65535 && public_ipv4(host);}
++    static bool public_ipv4(std::string_view host) {
++        unsigned parts[4]{};
++        for(int n=0;n<4;++n) {
++            const auto dot=host.find('.');
++            const auto piece=host.substr(0,dot);
++            if(piece.empty() || (piece.size()>1 && piece[0]=='0')) return false;
++            const auto [end,error]=std::from_chars(piece.data(),piece.data()+piece.size(),parts[n]);
++            if(error!=std::errc{} || end!=piece.data()+piece.size() || parts[n]>255) return false;
++            if(n<3) {if(dot==host.npos)return false;host.remove_prefix(dot+1);} else if(dot!=host.npos)return false;
++        }
++        const auto a=parts[0],b=parts[1],c=parts[2];
++        return a!=0 && a!=10 && a!=127 && a<224 && !(a==100 && b>=64 && b<=127) &&
++            !(a==169 && b==254) && !(a==172 && b>=16 && b<=31) && !(a==192 && (b==168 || (b==0 && (c==0 || c==2)) || (b==88 && c==99))) &&
++            !(a==198 && (b==18 || b==19 || (b==51 && c==100))) && !(a==203 && b==0 && c==113);
++    }
++private:
++    ConnectionPolicy(std::string host,int timeout):mode_{RuntimeMode::ReadOnlyConnection},hostname_{std::move(host)},timeout_{timeout}{}
++    RuntimeMode mode_{RuntimeMode::OfflineSmoke};
++    std::string hostname_;
++    int timeout_{1};
++};
++}
+diff --git a/src/core/connection_state.cpp b/src/core/connection_state.cpp
+new file mode 100644
+index 0000000..523f299
+--- /dev/null
++++ b/src/core/connection_state.cpp
+@@ -0,0 +1 @@
++#include "connection_state.hpp"
+diff --git a/src/core/connection_state.hpp b/src/core/connection_state.hpp
+new file mode 100644
+index 0000000..f730c7f
+--- /dev/null
++++ b/src/core/connection_state.hpp
+@@ -0,0 +1,15 @@
++#pragma once
++#include <atomic>
++namespace core {
++enum class ConnectionState { Stopped, Starting, Connected, Disconnected, Failed };
++class ConnectionStatus {
++public:
++    ConnectionState get() const {return state_.load();}
++    void set(ConnectionState state){state_.store(state);}
++    void cancel(){cancelled_.store(true);}
++    bool cancelled() const {return cancelled_.load();}
++private:
++    std::atomic<ConnectionState> state_{ConnectionState::Stopped};
++    std::atomic<bool> cancelled_{};
++};
++}
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index e1ffcd5..ba45e60 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -18,23 +18,26 @@
+ #include "../scripting/bindings/item_bindings.hpp"
+ 
+ namespace core {
+-Core::Core() : Core(std::function<void()>{}) { }
+-
+-Core::Core(std::function<void()> after_listeners_ready)
+-    : running_{ true }
+-    , scheduler_{ std::make_shared<Scheduler>() }
++Core::Core() : Core(ConnectionPolicy{}, {}, nullptr, nullptr) { }
++Core::Core(std::function<void()> callback) : Core(ConnectionPolicy{}, std::move(callback), nullptr, nullptr) { }
++Core::Core(ConnectionPolicy policy, inventory::InventoryState& inventory, ConnectionStatus& status)
++    : Core(std::move(policy), {}, &inventory, &status) { }
++Core::Core(ConnectionPolicy policy, std::function<void()> after_listeners_ready,
++    inventory::InventoryState* inventory, ConnectionStatus* status)
++    : policy_{std::move(policy)}, running_{true}, scheduler_{std::make_shared<Scheduler>()}
+ {
+-    server_ = std::make_unique<network::Server>(config_, dispatcher_);
+-    client_ = std::make_unique<network::Client>(config_, dispatcher_);
+-    web_server_ = std::make_unique<WebServer>(config_, dispatcher_, *client_, *server_);
+-    // Allows a local fault-injection test after real listeners exist.
+-    if (after_listeners_ready) after_listeners_ready();
+-
++    auto& inventory_state=inventory ? *inventory : local_inventory_;
++    auto& connection_status=status ? *status : local_status_;
++    connection_status.set(ConnectionState::Starting);
++    server_=std::make_unique<network::Server>(config_,dispatcher_,policy_.allow_upstream());
++    client_=std::make_unique<network::Client>(config_,dispatcher_,policy_);
+     packet::register_all_packets();
+-
+-    connection_handler_ = std::make_unique<handlers::ConnectionHandler>(dispatcher_, *client_, *server_, config_);
+-    forwarding_handler_ = std::make_unique<handlers::ForwardingHandler>(dispatcher_, *client_, *server_);
+-    world_handler_ = std::make_unique<handlers::WorldHandler>(dispatcher_);
++    inventory_handler_=std::make_unique<handlers::InventoryHandler>(dispatcher_,inventory_state,&connection_status);
++    connection_handler_=std::make_unique<handlers::ConnectionHandler>(dispatcher_,*client_,*server_,config_,policy_);
++    forwarding_handler_=std::make_unique<handlers::ForwardingHandler>(dispatcher_,*client_,*server_);
++    // World/item-database parsers and disk caches are unnecessary for passive inventory IDs.
++    web_server_=std::make_unique<WebServer>(config_,dispatcher_,*client_,*server_,policy_,WebServer::Fetcher{});
++    if(after_listeners_ready) after_listeners_ready();
+     ProbePolicy::initialize_extensions([&] {
+         command_handler_ = std::make_unique<command::CommandHandler>(config_, dispatcher_, scheduler_, *server_, *client_);
+     }, [&] {
+diff --git a/src/core/core.hpp b/src/core/core.hpp
+index 04985de..6fd8ab5 100644
+--- a/src/core/core.hpp
++++ b/src/core/core.hpp
+@@ -1,6 +1,10 @@
+ #pragma once
+ #include <chrono>
+ #include <functional>
++#include <atomic>
++#include "connection_policy.hpp"
++#include "connection_state.hpp"
++#include "handlers/inventory_handler.hpp"
+ #include "config.hpp"
+ #include "scheduler.hpp"
+ #include "web_server.hpp"
+@@ -22,6 +26,7 @@ class Core final : public utils::types::Immobile {
+ public:
+     Core();
+     explicit Core(std::function<void()> after_listeners_ready);
++    Core(ConnectionPolicy policy, inventory::InventoryState& inventory, ConnectionStatus& status);
+     ~Core();
+ 
+     void run() const;
+@@ -31,10 +36,14 @@ public:
+     [[nodiscard]] Config& get_config() { return config_; }
+ 
+ private:
++    Core(ConnectionPolicy policy, std::function<void()> after_listeners_ready, inventory::InventoryState* inventory, ConnectionStatus* status);
+     // Declared first so ENet outlives every socket and listener during unwinding.
+     network::ENetRuntime enet_runtime_;
+     Config config_;
+-    bool running_;
++    const ConnectionPolicy policy_;
++    std::atomic<bool> running_;
++    inventory::InventoryState local_inventory_;
++    ConnectionStatus local_status_;
+ 
+     event::Dispatcher dispatcher_;
+     std::shared_ptr<Scheduler> scheduler_;
+@@ -43,6 +52,7 @@ private:
+     std::unique_ptr<network::Client> client_;
+     std::unique_ptr<WebServer> web_server_;
+ 
++    std::unique_ptr<handlers::InventoryHandler> inventory_handler_;
+     std::unique_ptr<handlers::ConnectionHandler> connection_handler_;
+     std::unique_ptr<handlers::ForwardingHandler> forwarding_handler_;
+     std::unique_ptr<handlers::WorldHandler> world_handler_;
+diff --git a/src/core/handlers/connection_handler.cpp b/src/core/handlers/connection_handler.cpp
+index 8027dce..3be72f2 100644
+--- a/src/core/handlers/connection_handler.cpp
++++ b/src/core/handlers/connection_handler.cpp
+@@ -8,20 +8,23 @@ ConnectionHandler::ConnectionHandler(
+     event::Dispatcher& dispatcher,
+     network::Client& client,
+     network::Server& server,
+-    Config& config
++    Config& config,
++    ConnectionPolicy policy
+ )
+-    : dispatcher_{ dispatcher }
++    : policy_{std::move(policy)}
++    , dispatcher_{ dispatcher }
+     , client_{ client }
+     , server_{ server }
+     , config_{ config }
+     , pending_port_{ 65535 }
+ {
++    handles_.emplace_back(dispatcher_,event::Type::ClientDisconnect,
++        dispatcher_.append_listener(event::Type::ClientDisconnect,[this](const event::Event&){client_.disconnect_now();}));
+     setup_connection_handlers();
+     setup_on_send_to_server_handler();
+     setup_quit_handler();
+     setup_disconnect_handler();
+-    setup_send_item_database_data_handler();
+-    setup_on_super_main_start_handler();
++    // Keep item-database parsing and cache writes disabled in this candidate.
+ }
+ 
+ void ConnectionHandler::setup_connection_handlers()
+@@ -77,15 +80,19 @@ void ConnectionHandler::setup_on_send_to_server_handler()
+         on_send_to_server_type,
+         dispatcher_.append_listener(on_send_to_server_type, [this](const event::Event& event) {
+             const auto* evt = dynamic_cast<const event::TypedPacketEvent<packet::PacketId::OnSendToServer>*>(&event);
+-            if (!evt) {
+-                return;
+-            }
++            if (!evt || evt->direction != event::Direction::ClientBound) return;
+ 
+             const auto pkt{ evt->get<packet::game::OnSendToServer>() };
+             if (!pkt) {
+                 return;
+             }
+ 
++            if (!policy_.permits_endpoint(pkt->address,pkt->port)) {
++                evt->cancel();
++                client_.disconnect_now();
++                server_.disconnect();
++                return;
++            }
+             pending_address_ = pkt->address;
+             pending_port_ = pkt->port;
+ 
+diff --git a/src/core/handlers/connection_handler.hpp b/src/core/handlers/connection_handler.hpp
+index 580a1a1..5d81c28 100644
+--- a/src/core/handlers/connection_handler.hpp
++++ b/src/core/handlers/connection_handler.hpp
+@@ -15,7 +15,8 @@ public:
+         event::Dispatcher& dispatcher,
+         network::Client& client,
+         network::Server& server,
+-        Config& config
++        Config& config,
++        ConnectionPolicy policy = {}
+     );
+ 
+ private:
+@@ -27,6 +28,7 @@ private:
+     void setup_on_super_main_start_handler();
+ 
+ private:
++    const ConnectionPolicy policy_;
+     event::Dispatcher& dispatcher_;
+     network::Client& client_;
+     network::Server& server_;
+diff --git a/src/core/handlers/inventory_handler.cpp b/src/core/handlers/inventory_handler.cpp
+new file mode 100644
+index 0000000..3d424ad
+--- /dev/null
++++ b/src/core/handlers/inventory_handler.cpp
+@@ -0,0 +1,53 @@
++#include "inventory_handler.hpp"
++#include "../../packet/game/inventory.hpp"
++#include "../../packet/packet_decoder.hpp"
++#include "../probe_sink.hpp"
++namespace core::handlers {
++InventoryHandler::InventoryHandler(event::Dispatcher& dispatcher,inventory::InventoryState& state,ConnectionStatus* status)
++{
++    const auto listen=[&](event::Type type,event::Dispatcher::Callback callback){
++        handles_.emplace_back(dispatcher,type,dispatcher.append_listener(type,callback,event::Priority::Highest));
++    };
++    listen(event::packet_event_type(packet::PacketId::SendInventoryState),[&state](const event::Event& e){
++        const auto* update=dynamic_cast<const event::TypedPacketEvent<packet::PacketId::SendInventoryState>*>(&e);
++        if(update && update->is_client_bound()) {
++            const auto packet=update->get<packet::game::SendInventoryState>();
++            if(packet) state.accept_candidate(packet->extra);
++        }
++    });
++    listen(event::packet_event_type(packet::PacketId::ModifyItemInventory),[&state](const event::Event& e){
++        const auto* update=dynamic_cast<const event::TypedPacketEvent<packet::PacketId::ModifyItemInventory>*>(&e);
++        if(update && update->is_client_bound()) state.invalidate();
++    });
++    listen(event::packet_event_type(packet::PacketId::Disconnect),[&state,status](const event::Event& e){
++        if(dynamic_cast<const event::TypedPacketEvent<packet::PacketId::Disconnect>*>(&e)) {
++            state.invalidate();
++            if(status)status->set(ConnectionState::Disconnected);
++        }
++    });
++    listen(event::packet_event_type(packet::PacketId::OnSendToServer),[&state](const event::Event& e){
++        const auto* update=dynamic_cast<const event::TypedPacketEvent<packet::PacketId::OnSendToServer>*>(&e);
++        if(update && update->is_client_bound()) state.invalidate();
++    });
++    for(auto type:{event::Type::ClientConnect,event::Type::ServerConnect,event::Type::ClientDisconnect,event::Type::ServerDisconnect})
++        listen(type,[&state,status,type](const event::Event&){
++            state.invalidate();
++            if(status) {
++                const auto value=type==event::Type::ServerConnect ? ConnectionState::Connected :
++                    type==event::Type::ClientConnect ? ConnectionState::Starting : ConnectionState::Disconnected;
++                status->set(value);
++            }
++        });
++    listen(event::Type::ClientBoundPacket,[&state](const event::Event& e){
++        const auto* raw=dynamic_cast<const event::RawPacketEvent*>(&e);
++        if(!raw || raw->data.size()<5 || raw->data[0]!=std::byte{4} || (raw->data[4]!=std::byte{9} && raw->data[4]!=std::byte{13} && raw->data[4]!=std::byte{1})) return;
++        if(raw->data[4]==std::byte{13}) {state.invalidate();return;}
++        if(raw->data.size()<4+sizeof(packet::GameUpdatePacket)) {state.invalidate();return;}
++        packet::GameUpdatePacket packet{};
++        std::memcpy(&packet,raw->data.data()+4,sizeof(packet));
++        if(packet.data_size!=raw->data.size()-4-sizeof(packet)) {state.invalidate();return;}
++        // Raw forwarding also carries rejected typed packets; never retain inventory across a rejected handoff.
++        if(raw->data[4]==std::byte{1} && !packet::PacketDecoder::decode(raw->data,{},"ClientBound",true)) state.invalidate();
++    });
++}
++}
+diff --git a/src/core/handlers/inventory_handler.hpp b/src/core/handlers/inventory_handler.hpp
+new file mode 100644
+index 0000000..4334c9b
+--- /dev/null
++++ b/src/core/handlers/inventory_handler.hpp
+@@ -0,0 +1,13 @@
++#pragma once
++#include "../../event/event.hpp"
++#include "../../inventory/inventory_state.hpp"
++#include "../../packet/game/server.hpp"
++#include "../connection_state.hpp"
++namespace core::handlers {
++class InventoryHandler {
++public:
++    InventoryHandler(event::Dispatcher& dispatcher,inventory::InventoryState& state,ConnectionStatus* status=nullptr);
++private:
++    std::vector<event::ScopedHandle> handles_;
++};
++}
+diff --git a/src/core/web_server.cpp b/src/core/web_server.cpp
+index e29a9f4..b99d4f7 100644
+--- a/src/core/web_server.cpp
++++ b/src/core/web_server.cpp
+@@ -1,215 +1,80 @@
+ #include "web_server.hpp"
+-#include "probe_policy.hpp"
+ #include "verified_upstream.hpp"
+-
+-#include <fmt/format.h>
+-#include <magic_enum/magic_enum.hpp>
+-#include <spdlog/spdlog.h>
+-
+ #include "../utils/text_parse.hpp"
+-// ReSharper disable once CppUnusedIncludeDirective
+-#include "../utils/formatter/text_parse_formatter.hpp"
+-
++#include <charconv>
++#include <stdexcept>
+ namespace core {
+-WebServer::WebServer(
+-    Config& config,
+-    event::Dispatcher& dispatcher,
+-    network::Client& client,
+-    network::Server& server
+-)
+-    : config_{ config }
+-    , dispatcher_{ dispatcher }
+-    , client_{ client }
+-    , server_{ server }
+-    , dns_resolver_{ network::create_dns_provider(config_.get_client_config().dns_server) }
+-    , https_server_{ "./resources/cert.pem", "./resources/key.pem" }
+-    , pending_port_{ 65535 }
++WebServer::WebServer(Config& config,event::Dispatcher& dispatcher,network::Client& client,network::Server& server,ConnectionPolicy policy)
++    : WebServer(config,dispatcher,client,server,std::move(policy),{}) {}
++WebServer::WebServer(Config& config,event::Dispatcher& dispatcher,network::Client& client,network::Server& server,ConnectionPolicy policy,Fetcher fetcher)
++    : policy_{std::move(policy)}, fetcher_{std::move(fetcher)}, config_{config}, dispatcher_{dispatcher}, client_{client}, server_{server},
++      dns_resolver_{network::create_dns_provider("cloudflare")}, https_server_{"./resources/cert.pem","./resources/key.pem"}
+ {
+-    setup_server();
+-
+-    if (!https_server_.is_valid()) {
+-        throw std::runtime_error{ "Probe TLS certificate unavailable" };
+-    }
+-
+-    if (!https_server_.bind_to_port(ProbePolicy::listen_address(), config_.get_server_config().web_port)) {
+-        throw std::runtime_error{ "Probe HTTPS port unavailable" };
+-    }
+-
+-    handles_.reserve(2);
+-    handles_.emplace_back(dispatcher_, event::Type::ClientConnect,
+-        dispatcher_.append_listener(event::Type::ClientConnect, [this](const event::Event& e) { on_client_connect(e); }));
+-    handles_.emplace_back(dispatcher_, event::Type::ClientDisconnect,
+-        dispatcher_.append_listener(event::Type::ClientDisconnect, [this](const event::Event& e) { on_client_disconnect(e); }));
+-
+-    server_thread_ = std::thread{ [this] {
+-        try { listen_internal(); }
+-        catch (...) { https_server_.decommission(); }
+-    } };
++    if(!https_server_.is_valid()) throw std::runtime_error{"Probe TLS certificate unavailable"};
++    https_server_.set_payload_max_length(65536);
++    https_server_.set_read_timeout(3,0);
++    https_server_.set_write_timeout(3,0);
++    https_server_.set_keep_alive_max_count(2);
++    https_server_.set_exception_handler([](const auto&,auto& response,std::exception_ptr){
++        response.status=500; response.set_content("Connection request failed","text/plain");
++    });
++    if(!https_server_.bind_to_port("127.0.0.1",config_.get_server_config().web_port))
++        throw std::runtime_error{"Probe HTTPS port unavailable"};
++    handles_.emplace_back(dispatcher_,event::Type::ClientConnect,
++        dispatcher_.append_listener(event::Type::ClientConnect,[this](const auto&){on_client_connect();}));
++    handles_.emplace_back(dispatcher_,event::Type::ClientDisconnect,
++        dispatcher_.append_listener(event::Type::ClientDisconnect,[this](const auto&){
++            std::lock_guard lock(pending_mutex_);pending_address_.clear();pending_port_=0;
++        }));
++    server_thread_=std::thread([this]{try{listen_internal();}catch(...){https_server_.decommission();}});
+     https_server_.wait_until_ready();
+-    if (!https_server_.is_running()) {
+-        if (server_thread_.joinable()) server_thread_.join();
+-        throw std::runtime_error{ "Probe HTTPS listener failed" };
++    if(!https_server_.is_running()) {
++        if(server_thread_.joinable()) server_thread_.join();
++        throw std::runtime_error{"Probe HTTPS listener failed"};
+     }
+ }
+-
+-WebServer::~WebServer()
+-{
+-    https_server_.stop();
+-    if (server_thread_.joinable()) server_thread_.join();
+-}
+-
+-void WebServer::setup_server()
+-{
+-    https_server_.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+-        spdlog::info("{} {} {}", req.method, req.path, res.status);
+-    });
+-
+-    https_server_.set_error_handler([](const httplib::Request&, httplib::Response& res) {
+-        if (!res.body.empty()) return;
+-        res.set_content(
+-            fmt::format("{} ({})", httplib::status_message(res.status), res.status),
+-            "text/plain"
+-        );
+-    });
+-
+-    https_server_.set_exception_handler([](const httplib::Request&, httplib::Response& res, const std::exception_ptr& ep) {
+-        res.status = 500;
+-        try {
+-            std::rethrow_exception(ep);
+-        }
+-        catch (const std::exception& e) {
+-            res.set_content(fmt::format("{}", e.what()), "text/plain");
+-        }
+-        catch (...) { // This should never happen, but just in case
+-            res.set_content("Unknown Exception", "text/plain");
+-        }
+-    });
+-}
+-
++WebServer::~WebServer(){https_server_.stop();if(server_thread_.joinable())server_thread_.join();}
+ void WebServer::listen_internal()
+ {
+-    https_server_.Post("/growtopia/server_data.php", [this](
+-        const httplib::Request& req,
+-        httplib::Response& res
+-    ) -> bool {
+-        if (!ProbePolicy::allow_upstream_connections()) {
+-            res.status = 503;
+-            res.set_content("Offline probe: upstream connections are disabled", "text/plain");
+-            return true;
+-        }
+-        if (!req.headers.empty()) {
+-            spdlog::info("Headers:");
+-            for (const auto& [key, value] : req.headers) {
+-                spdlog::info("\t{}: {}", key, value);
+-            }
+-        }
+-
+-        if (!req.params.empty()) {
+-            spdlog::info("Params:");
+-            spdlog::info("\t{}", httplib::detail::params_to_query_str(req.params));
+-        }
+-
+-        if (!req.body.empty()) {
+-            spdlog::info("Body:");
+-            spdlog::info("\t{}", req.body);
+-        }
+-
+-        std::string server_address = config_.get_server_config().address;
+-        if (server_address.empty()) {
+-            res.status = 500;
+-            res.set_content("Failed to resolve server address", "text/plain");
+-            return true;
++    https_server_.Post("/growtopia/server_data.php",[this](const httplib::Request& request,httplib::Response& response){
++        if(!policy_.allow_upstream()) {
++            response.status=503;response.set_content("Offline probe: upstream connections are disabled","text/plain");return;
+         }
+-
+-        auto cli = make_verified_upstream(server_address);
+-
+-        httplib::Headers headers{
+-            { "User-Agent", req.get_header_value("User-Agent") },
+-            { "Host", server_address }
+-        };
+-
+-        httplib::Result response{ cli->Post("/growtopia/server_data.php", headers, req.params) };
+-        if (!response) {
+-            spdlog::error(
+-                "Response is null: httplib::Error::{}",
+-                magic_enum::enum_name(response.error())
+-            );
+-
+-            res.status = 502;
+-            res.set_content("Failed to get response from server", "text/plain");
+-            return true;
++        const auto fail=[&]{response.status=502;response.set_content("Upstream connection unavailable","text/plain");};
++        {std::lock_guard lock(pending_mutex_);pending_address_.clear();pending_port_=0;}
++        const auto result=fetcher_ ? fetcher_(request) : request_upstream(request);
++        if(!result || result->empty() || result->size()>65536){fail();return;}
++        utils::TextParse data{*result};
++        const auto host=data.get("server",0);
++        const auto text=data.get("port",0);
++        int port{};const auto [end,error]=std::from_chars(text.data(),text.data()+text.size(),port);
++        if(error!=std::errc{} || end!=text.data()+text.size() || !policy_.permits_endpoint(host,port)){fail();return;}
++        {
++            std::lock_guard lock(pending_mutex_);pending_address_=host;pending_port_=static_cast<std::uint16_t>(port);
+         }
+-
+-        if (response.error() != httplib::Error::Success || response->status != 200) {
+-            spdlog::error(
+-                "Failed to get response: {}",
+-                response.error() == httplib::Error::Success
+-                    ? fmt::format("HTTP status: {}", response->status)
+-                    : fmt::format("HTTP error: {}", httplib::to_string(response.error()))
+-            );
+-
+-            res.status = 502;
+-            res.set_content("Failed to get response from server", "text/plain");
+-            return true;
+-        }
+-
+-        if (response->body.empty()) {
+-            res.status = 502;
+-            res.set_content("Empty response from server", "text/plain");
+-            return true;
+-        }
+-
+-        utils::TextParse text_parse{ response->body };
+-        if (text_parse.empty()) {
+-            spdlog::error("Failed to parse server_data.php response");
+-            res.status = 500;
+-            return true;
+-        }
+-
+-        spdlog::info("Original server_data.php response:\n{}", text_parse);
+-
+-        pending_address_ = text_parse.get("server", 0);
+-
+-        std::string port{ text_parse.get("port", 0) };
+-        if (
+-            auto [ptr, ec] = std::from_chars(port.data(), port.data() + port.size(), pending_port_);
+-            ec != std::errc{}
+-        ) {
+-            spdlog::error("Failed to parse port from server_data.php response");
+-            res.status = 500;
+-            return true;
+-        }
+-
+-        text_parse.set("server", { "127.0.0.1" });
+-        text_parse.set("port", { std::to_string(config_.get_server_config().port) });
+-        text_parse.set("type2", { "1" });
+-
+-        spdlog::debug("Modified server_data.php response:\n{}", text_parse);
+-
+-        res.set_content(text_parse.get_raw(), "text/html");
+-        return true;
++        data.set("server",{"127.0.0.1"});
++        data.set("port",{std::to_string(config_.get_server_config().port)});
++        data.set("type2",{"1"});
++        response.set_content(data.get_raw(),"text/plain");
+     });
+-
+     https_server_.listen_after_bind();
+ }
+-
+-void WebServer::on_client_connect(const event::Event& e)
++std::optional<std::string> WebServer::request_upstream(const httplib::Request& request) const
+ {
+-    if (pending_port_ == 65535) {
+-        return;
+-    }
+-
+-    spdlog::info("Connecting to Growtopia server at {}:{}", pending_address_, pending_port_);
+-
+-    client_.connect(pending_address_, pending_port_);
+-
+-    pending_address_.clear();
+-    pending_port_ = 65535;
++    const auto ip=dns_resolver_.resolve_ip(policy_.hostname());
++    if(!ConnectionPolicy::public_ipv4(ip))return std::nullopt;
++    auto upstream=make_verified_upstream(policy_.hostname());
++    upstream->set_hostname_addr_map({{policy_.hostname(),ip}});
++    upstream->set_follow_location(false);upstream->set_payload_max_length(65536);
++    httplib::Headers headers{{"User-Agent",request.get_header_value("User-Agent")},{"Host",policy_.hostname()}};
++    const auto result=upstream->Post("/growtopia/server_data.php",headers,request.body,request.get_header_value("Content-Type"));
++    if(!result || result->status!=200)return std::nullopt;
++    return result->body;
+ }
+-
+-void WebServer::on_client_disconnect(const event::Event& e)
++void WebServer::on_client_connect()
+ {
+-    pending_address_.clear();
+-    pending_port_ = 65535;
++    std::string address;std::uint16_t port{};
++    {std::lock_guard lock(pending_mutex_);address=std::move(pending_address_);port=pending_port_;pending_port_=0;}
++    if(port) client_.connect(address,port);
+ }
+ }
+diff --git a/src/core/web_server.hpp b/src/core/web_server.hpp
+index 81353bd..b84ead1 100644
+--- a/src/core/web_server.hpp
++++ b/src/core/web_server.hpp
+@@ -1,43 +1,38 @@
+ #pragma once
+ #include <httplib.h>
+ #include <thread>
+-
+-#include "../core/config.hpp"
++#include <mutex>
++#include <functional>
++#include <optional>
++#include "connection_policy.hpp"
++#include "config.hpp"
+ #include "../event/event.hpp"
+ #include "../network/client.hpp"
+-#include "../network/dns_resolver.hpp"
+ #include "../network/server.hpp"
+-
++#include "../network/dns_resolver.hpp"
+ namespace core {
+ class WebServer {
+ public:
+-    WebServer(
+-        Config& config,
+-        event::Dispatcher& dispatcher,
+-        network::Client& client,
+-        network::Server& server
+-    );
++    using Fetcher=std::function<std::optional<std::string>(const httplib::Request&)>;
++    WebServer(Config&,event::Dispatcher&,network::Client&,network::Server&,ConnectionPolicy policy = {});
++    WebServer(Config&,event::Dispatcher&,network::Client&,network::Server&,ConnectionPolicy,Fetcher);
+     ~WebServer();
+-
+ private:
+-    void setup_server();
+     void listen_internal();
+-
+-    void on_client_connect(const event::Event& e);
+-    void on_client_disconnect(const event::Event& e);
+-
+-private:
++    std::optional<std::string> request_upstream(const httplib::Request&) const;
++    void on_client_connect();
++    const ConnectionPolicy policy_;
++    const Fetcher fetcher_;
+     Config& config_;
+     event::Dispatcher& dispatcher_;
+     network::Client& client_;
+     network::Server& server_;
+-
+     network::DnsResolver dns_resolver_;
+     httplib::SSLServer https_server_;
+     std::thread server_thread_;
+-
++    std::mutex pending_mutex_;
+     std::string pending_address_;
+-    uint16_t pending_port_;
++    std::uint16_t pending_port_{};
+     std::vector<event::ScopedHandle> handles_;
+ };
+ }
+diff --git a/src/inventory/inventory_decoder.cpp b/src/inventory/inventory_decoder.cpp
+new file mode 100644
+index 0000000..00d7792
+--- /dev/null
++++ b/src/inventory/inventory_decoder.cpp
+@@ -0,0 +1,23 @@
++#include "inventory_decoder.hpp"
++#include <unordered_set>
++namespace inventory {
++std::optional<std::vector<InventoryEntry>> decode_candidate(std::span<const std::byte> bytes)
++{
++    if (bytes.size()<7 || bytes[0]!=std::byte{1}) return std::nullopt;
++    const auto u8=[&](std::size_t p){return std::to_integer<std::uint32_t>(bytes[p]);};
++    const auto capacity=u8(1)|(u8(2)<<8)|(u8(3)<<16)|(u8(4)<<24);
++    const auto count=u8(5)|(u8(6)<<8);
++    if(capacity>4096 || count>capacity || bytes.size()!=7+4*count) return std::nullopt;
++    std::vector<InventoryEntry> entries; entries.reserve(count);
++    std::unordered_set<std::uint32_t> seen;
++    for(std::size_t n=0;n<count;++n) {
++        const auto pos=7+n*4;
++        const auto id=u8(pos)|(u8(pos+1)<<8);
++        const auto quantity=u8(pos+2);
++        // The last record byte is opaque; do not mistake it for high quantity bits.
++        if(quantity==0 || !seen.insert(id).second) return std::nullopt;
++        entries.push_back({id,quantity});
++    }
++    return entries;
++}
++}
+diff --git a/src/inventory/inventory_decoder.hpp b/src/inventory/inventory_decoder.hpp
+new file mode 100644
+index 0000000..3602513
+--- /dev/null
++++ b/src/inventory/inventory_decoder.hpp
+@@ -0,0 +1,11 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <span>
++#include <vector>
++namespace inventory {
++struct InventoryEntry { std::uint32_t item_id; std::uint32_t quantity; };
++// An explicitly unverified v1 candidate, never evidence of current-client compatibility.
++std::optional<std::vector<InventoryEntry>> decode_candidate(std::span<const std::byte> bytes);
++}
+diff --git a/src/inventory/inventory_state.cpp b/src/inventory/inventory_state.cpp
+new file mode 100644
+index 0000000..62b90c0
+--- /dev/null
++++ b/src/inventory/inventory_state.cpp
+@@ -0,0 +1,18 @@
++#include "inventory_state.hpp"
++namespace inventory {
++InventorySnapshot InventoryState::snapshot() const {std::lock_guard lock(mutex_);return snapshot_;}
++bool InventoryState::accept_candidate(std::span<const std::byte> bytes)
++{
++    auto parsed=decode_candidate(bytes);
++    std::lock_guard lock(mutex_);
++    ++snapshot_.generation;
++    snapshot_.entries=parsed ? std::move(*parsed) : std::vector<InventoryEntry>{};
++    snapshot_.status=parsed ? InventoryStatus::Candidate : InventoryStatus::Stale;
++    return parsed.has_value();
++}
++void InventoryState::invalidate()
++{
++    std::lock_guard lock(mutex_);++snapshot_.generation;
++    snapshot_.status=InventoryStatus::Stale;snapshot_.entries.clear();
++}
++}
+diff --git a/src/inventory/inventory_state.hpp b/src/inventory/inventory_state.hpp
+new file mode 100644
+index 0000000..ba7d3d3
+--- /dev/null
++++ b/src/inventory/inventory_state.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++#include <mutex>
++#include "inventory_decoder.hpp"
++namespace inventory {
++enum class InventoryStatus { Unavailable, Candidate, Stale, Verified };
++struct InventorySnapshot {
++    std::uint64_t generation{};
++    InventoryStatus status{InventoryStatus::Unavailable};
++    std::vector<InventoryEntry> entries;
++};
++class InventoryState {
++public:
++    InventorySnapshot snapshot() const;
++    bool accept_candidate(std::span<const std::byte> bytes);
++    void invalidate();
++private:
++    mutable std::mutex mutex_;
++    InventorySnapshot snapshot_;
++};
++}
+diff --git a/src/main.cpp b/src/main.cpp
+index 24fbf33..29e03c8 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -2,6 +2,9 @@
+ #include <iostream>
+ #include <memory>
+ #include <string_view>
++#include <charconv>
++#include <thread>
++#include "ui/status_window.hpp"
+ #include <spdlog/sinks/stdout_color_sinks.h>
+ 
+ #include "core/core.hpp"
+@@ -9,7 +12,11 @@
+ 
+ int main(int argc, char** argv)
+ {
+-    if (argc != 2 || std::string_view{ argv[1] } != "--offline-smoke-test") {
++    const bool offline=argc==2 && std::string_view{argv[1]}=="--offline-smoke-test";
++    const bool smoke=argc==2 && std::string_view{argv[1]}=="--ui-smoke-test";
++    const bool live=argc==6 && std::string_view{argv[1]}=="--connection-test" &&
++        std::string_view{argv[2]}=="--upstream" && std::string_view{argv[4]}=="--timeout";
++    if (!offline && !smoke && !live) {
+         std::cerr << "Offline readiness build. Use --offline-smoke-test for a bounded local check.\n";
+         return 2;
+     }
+@@ -20,6 +27,35 @@ int main(int argc, char** argv)
+         auto logger = std::make_shared<spdlog::logger>("marvprox-probe", filter);
+         logger->set_level(spdlog::level::trace);
+         spdlog::set_default_logger(logger);
++        if(smoke || live) {
++            inventory::InventoryState inventory;
++            core::ConnectionStatus status;
++            core::ConnectionPolicy policy;
++            if(live) {
++                int timeout{};const std::string_view value{argv[5]};
++                const auto [end,error]=std::from_chars(value.data(),value.data()+value.size(),timeout);
++                if(error!=std::errc{} || end!=value.data()+value.size())throw std::invalid_argument{"Connection settings invalid"};
++                policy=core::ConnectionPolicy::read_only(argv[3],timeout);
++            }
++            if(smoke) {
++                const std::vector<std::byte> sample{std::byte{1},std::byte{20},std::byte{0},std::byte{0},std::byte{0},std::byte{1},std::byte{0},std::byte{100},std::byte{0},std::byte{12},std::byte{0}};
++                inventory.accept_candidate(sample);status.set(core::ConnectionState::Connected);
++            }
++            std::jthread worker;
++            if(live) worker=std::jthread([&](std::stop_token stop){
++                try {
++                    core::Core runtime{policy,inventory,status};
++                    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{policy.timeout_seconds()};
++                    while(!stop.stop_requested() && !status.cancelled() && std::chrono::steady_clock::now()<deadline)
++                        runtime.run_for(std::chrono::milliseconds{10});
++                    inventory.invalidate();status.set(core::ConnectionState::Stopped);
++                } catch(...) {inventory.invalidate();status.set(core::ConnectionState::Failed);}
++            });
++            ui::StatusWindow window;
++            const int result=window.run(inventory,status,smoke);
++            status.cancel();worker.request_stop();
++            return result;
++        }
+         core::emit_probe_event(core::ProbeEvent::Starting);
+         {
+             core::Core runtime;
+diff --git a/src/network/client.cpp b/src/network/client.cpp
+index d6880a1..0934e0d 100644
+--- a/src/network/client.cpp
++++ b/src/network/client.cpp
+@@ -9,8 +9,9 @@
+ #include "../utils/network.hpp"
+ 
+ namespace network {
+-Client::Client(core::Config& config, event::Dispatcher& dispatcher)
+-    : ENetWrapper{ create_host() }
++Client::Client(core::Config& config, event::Dispatcher& dispatcher, core::ConnectionPolicy policy)
++    : ENetWrapper{ policy.allow_upstream() ? create_connection_client_host() : create_host() }
++    , policy_{std::move(policy)}
+     , config_{ config }
+     , dispatcher_{ dispatcher }
+     , peer_{ nullptr }
+@@ -29,13 +30,13 @@ ENetHost* Client::create_host()
+ 
+ bool Client::connect(const std::string& host, std::uint16_t port)
+ {
+-    if (!core::ProbePolicy::allow_upstream_connections()) return false;
++    if (!policy_.permits_endpoint(host, port)) return false;
+     if (!host_) {
+         return false;
+     }
+ 
+     ENetAddress address{};
+-    enet_address_set_host(&address, host.c_str());
++    if (enet_address_set_host_ip(&address, host.c_str()) != 0) return false;
+     address.port = port;
+ 
+     peer_ = enet_host_connect(host_, &address, 2, 0);
+@@ -44,6 +45,7 @@ bool Client::connect(const std::string& host, std::uint16_t port)
+ 
+ void Client::on_connect(ENetPeer* peer)
+ {
++    if (peer != peer_) { enet_peer_reset(peer); return; }
+     spdlog::info(
+         "Proxy client connected to Growtopia server at {}:{}",
+         utils::network::format_ip_address(peer->address.host),
+@@ -62,13 +64,13 @@ void Client::on_receive(ENetPeer* peer, const std::span<const std::byte> data)
+         return;
+     }
+ 
+-    if (data.size() < 4) {
++    if (data.size() < 4 || data.size() > 1024 * 1024) {
+         spdlog::warn("Received malformed packet from Growtopia server (size {})", data.size());
+         disconnect();
+         return;
+     }
+ 
+-    const auto decoded{ packet::PacketDecoder::decode(data, config_.get_log_config(), "ClientBound") };
++    const auto decoded{ packet::PacketDecoder::decode(data, config_.get_log_config(), "ClientBound", policy_.allow_upstream()) };
+     if (!decoded.has_value()) {
+         const event::RawPacketEvent evt{ event::Type::ClientBoundPacket, data };
+         dispatcher_.dispatch(evt);
+diff --git a/src/network/client.hpp b/src/network/client.hpp
+index 46ae1de..e95361a 100644
+--- a/src/network/client.hpp
++++ b/src/network/client.hpp
+@@ -4,6 +4,7 @@
+ #include <enet/enet.h>
+ 
+ #include "connection.hpp"
++#include "../core/connection_policy.hpp"
+ #include "enet_wrapper.hpp"
+ #include "../core/config.hpp"
+ #include "../event/event.hpp"
+@@ -12,7 +13,7 @@
+ namespace network {
+ class Client final : public ENetWrapper, public IConnection {
+ public:
+-    Client(core::Config& config, event::Dispatcher& dispatcher);
++    Client(core::Config& config, event::Dispatcher& dispatcher, core::ConnectionPolicy policy = {});
+ 
+     bool connect(const std::string& host, std::uint16_t port);
+ 
+@@ -35,6 +36,7 @@ private:
+     static ENetHost* create_host();
+ 
+ private:
++    const core::ConnectionPolicy policy_;
+     core::Config& config_;
+ 
+     event::Dispatcher& dispatcher_;
+diff --git a/src/network/dns_answer.hpp b/src/network/dns_answer.hpp
+new file mode 100644
+index 0000000..e838495
+--- /dev/null
++++ b/src/network/dns_answer.hpp
+@@ -0,0 +1,18 @@
++#pragma once
++#include <string>
++#include <string_view>
++#include <vector>
++#include <glaze/glaze.hpp>
++#include "../core/connection_policy.hpp"
++namespace network {
++struct SafeDnsRecord {int type{};std::string data;};
++struct SafeDnsResponse {int Status{-1};std::vector<SafeDnsRecord> Answer;};
++inline std::string parse_dns_answer(std::string_view body) {
++    if(body.size()>65536)return {};
++    SafeDnsResponse response;
++    if(glz::read<glz::opts{.error_on_unknown_keys=false}>(response,body) || response.Status!=0)return {};
++    for(const auto& record:response.Answer)
++        if(record.type==1 && core::ConnectionPolicy::public_ipv4(record.data))return record.data;
++    return {};
++}
++}
+diff --git a/src/network/dns_resolver.cpp b/src/network/dns_resolver.cpp
+index b1bafd9..6a80445 100644
+--- a/src/network/dns_resolver.cpp
++++ b/src/network/dns_resolver.cpp
+@@ -1,133 +1,25 @@
+ #include "dns_resolver.hpp"
+-
+-#include <httplib.h>
+-#include <fmt/format.h>
+-#include <glaze/glaze.hpp>
+-#include <magic_enum/magic_enum.hpp>
+-#include <spdlog/spdlog.h>
+-
+-#include "../utils/network.hpp"
+-
++#include "dns_answer.hpp"
++#include "../core/verified_upstream.hpp"
+ namespace network {
+-struct DnsAnswer {
+-    std::string data;
+-};
+-
+-struct DnsResponse {
+-    int status;
+-    std::vector<DnsAnswer> answer;
+-};
+-
+ std::unique_ptr<DnsProvider> create_dns_provider(const std::string& name)
+ {
+-    if (name == "cloudflare") {
+-        return std::make_unique<CloudflareDnsProvider>();
+-    }
+-
+-    if (name == "google") {
+-        return std::make_unique<GoogleDnsProvider>();
+-    }
+-
+-    spdlog::warn("Unknown DNS provider: {}, defaulting to Google DNS", name);
+-    return std::make_unique<GoogleDnsProvider>();
++    if(name=="google")return std::make_unique<GoogleDnsProvider>();
++    return std::make_unique<CloudflareDnsProvider>();
+ }
+-
+-DnsResolver::DnsResolver(std::unique_ptr<DnsProvider> provider)
+-    : provider_{ std::move(provider) }
+-{
+-
+-}
+-
++DnsResolver::DnsResolver(std::unique_ptr<DnsProvider> provider):provider_{std::move(provider)}{}
+ DnsResult DnsResolver::resolve_domain(const std::string& domain) const
+ {
+-    httplib::Headers headers{
+-        {"Accept", "application/dns-json"}
+-    };
+-
+-    httplib::Client cli{ fmt::format("https://{}", provider_->get_host()) };
+-
+-    cli.set_connection_timeout(5);
+-    cli.set_read_timeout(10);
+-    cli.set_write_timeout(5);
+-
+-    httplib::Result res{ cli.Get(
+-        fmt::format("{}?name={}&type=A", provider_->get_path(), domain),
+-        headers
+-    ) };
+-
+-    if (!res) {
+-        spdlog::error(
+-            "DNS request failed: httplib::Error::{}",
+-            magic_enum::enum_name(res.error())
+-        );
+-        return { DnsStatus::ServerFail, {} };
+-    }
+-
+-    if (res.error() != httplib::Error::Success || res->status != 200) {
+-        spdlog::error(
+-            "Failed to get DNS response: {}",
+-            res.error() == httplib::Error::Success
+-                ? fmt::format("HTTP status: {}", res->status)
+-                : fmt::format("HTTP error: {}", httplib::to_string(res.error()))
+-        );
+-        return { DnsStatus::ServerFail, {} };
+-    }
+-
+-    if (res->body.empty()) {
+-        return { DnsStatus::ServerFail, {} };
+-    }
+-
+-    DnsResponse dns_response{};
+-    if (const auto ec = glz::read<glz::opts{.error_on_unknown_keys = false }>(dns_response, res->body)) {
+-        spdlog::error("Failed to parse DNS response: {}", glz::format_error(ec, res->body));
+-        return { DnsStatus::ServerFail, {} };
+-    }
+-
+-    const auto status = static_cast<DnsStatus>(dns_response.status);
+-    if (status != DnsStatus::NoError) {
+-        return { status, {} };
+-    }
+-
+-    if (dns_response.answer.empty()) {
+-        return { DnsStatus::NameError, {} };
+-    }
+-
+-    return { status, dns_response.answer.back().data };
++    if(!core::ConnectionPolicy::official_hostname(domain))return {DnsStatus::NameError,{}};
++    auto client=core::make_verified_upstream(provider_->get_host());
++    client->set_follow_location(false);client->set_payload_max_length(65536);
++    const auto result=client->Get(provider_->get_path()+"?name="+domain+"&type=A",httplib::Headers{{"Accept","application/dns-json"}});
++    if(!result || result->status!=200)return {DnsStatus::ServerFail,{}};
++    const auto address=parse_dns_answer(result->body);
++    return address.empty() ? DnsResult{DnsStatus::NameError,{}} : DnsResult{DnsStatus::NoError,address};
+ }
+-
+ std::string DnsResolver::resolve_ip(const std::string& host) const
+ {
+-    if (utils::network::classify_host(host) != utils::network::HostType::Hostname) {
+-        return host;
+-    }
+-
+-    auto [status, ip] = resolve_domain(host);
+-
+-    if (status != DnsStatus::NoError) {
+-        spdlog::error(
+-            "DNS resolution failed for {}: {}",
+-            host,
+-            magic_enum::enum_name(status)
+-        );
+-        return {};
+-    }
+-
+-    spdlog::info("Resolved {} to {}", host, ip);
+-    return ip;
++    const auto result=resolve_domain(host);return result.status==DnsStatus::NoError ? result.ip : std::string{};
+ }
+ }
+-
+-template<> struct glz::meta<network::DnsResponse> {
+-    static constexpr std::string_view rename_key(const std::string_view key) {
+-        if (key == "status") {
+-            return "Status";
+-        }
+-
+-        if (key == "answer") {
+-            return "Answer";
+-        }
+-
+-        // ReSharper disable once CppDFALocalValueEscapesFunction
+-        return key;
+-    }
+-};
+diff --git a/src/network/probe_host.cpp b/src/network/probe_host.cpp
+index 9dbda3b..6ccadd5 100644
+--- a/src/network/probe_host.cpp
++++ b/src/network/probe_host.cpp
+@@ -3,10 +3,11 @@
+ 
+ namespace network {
+ namespace {
+-ENetHost* create_host(std::uint16_t port, bool server)
++ENetHost* create_host(std::uint16_t port, bool server, const ENetAddress* bind_address = nullptr)
+ {
+     ENetAddress address{};
+-    if (enet_address_set_host_ip(&address, core::ProbePolicy::listen_address()) != 0) return nullptr;
++    if (bind_address) address = *bind_address;
++    else if (enet_address_set_host_ip(&address, core::ProbePolicy::listen_address()) != 0) return nullptr;
+     address.port = port;
+     auto* host = enet_host_create(&address, 1, 2, 0, 0);
+     if (!host) return nullptr;
+@@ -22,4 +23,15 @@ ENetHost* create_host(std::uint16_t port, bool server)
+ }
+ ENetHost* create_probe_server_host(std::uint16_t port) { return create_host(port, true); }
+ ENetHost* create_probe_client_host() { return create_host(0, false); }
++ENetHost* create_connection_client_host()
++{
++    // UDP connect selects a route without sending a datagram. Bind ENet to that local NIC.
++    const auto socket=enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
++    if(socket==ENET_SOCKET_NULL)return nullptr;
++    ENetAddress route{},local{};enet_address_set_host_ip(&route,"1.1.1.1");route.port=9;
++    const bool ready=enet_socket_connect(socket,&route)==0 && enet_socket_get_address(socket,&local)==0;
++    enet_socket_destroy(socket);
++    if(!ready)return nullptr;
++    return create_host(0,false,&local);
++}
+ }
+diff --git a/src/network/probe_host.hpp b/src/network/probe_host.hpp
+index 54c6071..e1ed6e3 100644
+--- a/src/network/probe_host.hpp
++++ b/src/network/probe_host.hpp
+@@ -5,4 +5,5 @@
+ namespace network {
+ [[nodiscard]] ENetHost* create_probe_server_host(std::uint16_t port);
+ [[nodiscard]] ENetHost* create_probe_client_host();
++[[nodiscard]] ENetHost* create_connection_client_host();
+ }
+diff --git a/src/network/server.cpp b/src/network/server.cpp
+index 3077b47..1a5cae3 100644
+--- a/src/network/server.cpp
++++ b/src/network/server.cpp
+@@ -9,8 +9,10 @@
+ #include "../utils/network.hpp"
+ 
+ namespace network {
+-Server::Server(core::Config& config, event::Dispatcher& dispatcher)
++Server::Server(core::Config& config, event::Dispatcher& dispatcher) : Server(config,dispatcher,false) {}
++Server::Server(core::Config& config, event::Dispatcher& dispatcher, bool observer_only)
+     : ENetWrapper{ create_host(config.get_server_config().port) }
++    , observer_only_{observer_only}
+     , config_{ config }
+     , dispatcher_{ dispatcher }
+     , peer_{ nullptr }
+@@ -58,7 +60,7 @@ void Server::on_receive(ENetPeer* peer, const std::span<const std::byte> data)
+         return;
+     }
+ 
+-    const auto decoded{ packet::PacketDecoder::decode(data, config_.get_log_config(), "ServerBound") };
++    const auto decoded{ packet::PacketDecoder::decode(data, config_.get_log_config(), "ServerBound", observer_only_) };
+     if (!decoded.has_value()) {
+         const event::RawPacketEvent evt{ event::Type::ServerBoundPacket, data };
+         dispatcher_.dispatch(evt);
+diff --git a/src/network/server.hpp b/src/network/server.hpp
+index 8eff590..8cd6165 100644
+--- a/src/network/server.hpp
++++ b/src/network/server.hpp
+@@ -11,6 +11,7 @@ namespace network {
+ class Server final : public ENetWrapper, public IConnection {
+ public:
+     Server(core::Config& config, event::Dispatcher& dispatcher);
++    Server(core::Config& config, event::Dispatcher& dispatcher, bool observer_only);
+ 
+     [[nodiscard]] bool write(std::span<const std::byte> data, int channel = 0) const override;
+     [[nodiscard]] bool write(const std::vector<std::byte>& data, int channel = 0) const override;
+@@ -31,6 +32,7 @@ private:
+     static ENetHost* create_host(std::uint16_t port);
+ 
+ private:
++    const bool observer_only_;
+     core::Config& config_;
+ 
+     event::Dispatcher& dispatcher_;
+diff --git a/src/packet/game/server.hpp b/src/packet/game/server.hpp
+index 68ddf82..a54b6e4 100644
+--- a/src/packet/game/server.hpp
++++ b/src/packet/game/server.hpp
+@@ -37,11 +37,17 @@ struct OnSendToServer : VariantPacket<PacketId::OnSendToServer> {
+         variant = var->variant;
+         game_packet = var->game_packet;
+ 
+-        if (variant.size() < 5) {
++        if (variant.size() < 7) {
+             return false;
+         }
+ 
+-        port = variant.get<int32_t>(1);
++        const auto values=variant.variants();
++        if(!std::holds_alternative<int32_t>(values[1]) || !std::holds_alternative<int32_t>(values[2]) ||
++            !std::holds_alternative<int32_t>(values[3]) || !std::holds_alternative<std::string>(values[4]) ||
++            !std::holds_alternative<uint32_t>(values[5]) || !std::holds_alternative<std::string>(values[6]))return false;
++        const auto raw_port=variant.get<int32_t>(1);
++        if(raw_port<=0 || raw_port>65535)return false;
++        port=static_cast<uint16_t>(raw_port);
+         token = variant.get<int32_t>(2);
+         user = variant.get<int32_t>(3);
+ 
+@@ -62,19 +68,12 @@ struct OnSendToServer : VariantPacket<PacketId::OnSendToServer> {
+ 
+     Payload write() override
+     {
+-        utils::TextParse text_parse{};
+-        text_parse.add(address, door_id, uuid_token);
+-
+-        const PacketVariant variant{
+-            "OnSendToServer",
+-            static_cast<int32_t>(port),
+-            token,
+-            user,
+-            text_parse.get_raw(),
+-            static_cast<uint32_t>(login_mode),
+-            username
+-        };
+-        return VariantPayload{ game_packet, variant };
++        auto updated=variant;
++        updated.set(1,static_cast<int32_t>(port));
++        const auto original=variant.get<std::string>(4);
++        const auto delimiter=original.find('|');
++        updated.set(4,address+(delimiter==std::string::npos ? std::string{} : original.substr(delimiter)));
++        return VariantPayload{ game_packet, updated };
+     }
+ };
+ 
+diff --git a/src/packet/packet_decoder.cpp b/src/packet/packet_decoder.cpp
+index 15a3d7a..6b9fe6b 100644
+--- a/src/packet/packet_decoder.cpp
++++ b/src/packet/packet_decoder.cpp
+@@ -6,11 +6,41 @@
+ #include "../utils/formatter/text_parse_formatter.hpp"
+ 
+ namespace packet {
++namespace {
++bool valid_variant(std::span<const std::byte> data)
++{
++    if(data.empty())return false;
++    const auto count=std::to_integer<unsigned>(data[0]);
++    if(count==0 || count>32)return false;
++    std::size_t offset=1;
++    for(unsigned i=0;i<count;++i) {
++        if(data.size()-offset<2 || std::to_integer<unsigned>(data[offset])!=i)return false;
++        const auto type=std::to_integer<unsigned>(data[offset+1]);offset+=2;
++        std::size_t length{};
++        if(type==2) {
++            if(data.size()-offset<4)return false;
++            std::uint32_t value{};std::memcpy(&value,data.data()+offset,4);offset+=4;
++            if(value>65535)return false;
++            length=value;
++        } else if(type==1 || type==5 || type==9)length=4;
++        else if(type==3)length=8;
++        else if(type==4)length=12;
++        else return false;
++        if(length>data.size()-offset)return false;
++        offset+=length;
++    }
++    return offset==data.size();
++}
++}
++std::optional<std::shared_ptr<IPacket>> PacketDecoder::decode(std::span<const std::byte> data,
++    const core::Config::LogConfig& log,std::string_view direction) {return decode(data,log,direction,false);}
++
+ [[nodiscard]] std::optional<std::shared_ptr<IPacket>> PacketDecoder::decode(
+     std::span<const std::byte> data,
+     const core::Config::LogConfig& log_config,
+-    std::string_view direction
++    std::string_view direction, bool observer_only
+ ) {
++    if (data.size() > 1024 * 1024) return std::nullopt;
+     spdlog::info("[{}] Decoding packet of size {} bytes", direction, data.size());
+ 
+     utils::ByteStream stream{ data.data(), data.size() };
+@@ -20,6 +50,8 @@ namespace packet {
+         return std::nullopt;
+     }
+ 
++    if (observer_only && msg_type != NET_MESSAGE_GAME_PACKET) return std::nullopt;
++
+     switch (msg_type) {
+     case NET_MESSAGE_SERVER_HELLO: {
+         TextPayload text_payload{ 
+@@ -35,7 +67,10 @@ namespace packet {
+     case NET_MESSAGE_GENERIC_TEXT:
+     case NET_MESSAGE_GAME_MESSAGE: {
+         std::string message{};
+-        stream.read(message, static_cast<uint16_t>(stream.get_size() - sizeof(NetMessageType) - 1));
++        const auto body_size = data.size() - sizeof(NetMessageType);
++        if (body_size == 0 || body_size > 65536 || data.back() != std::byte{0}) return std::nullopt;
++        message.assign(reinterpret_cast<const char*>(data.data() + sizeof(NetMessageType)), body_size - 1);
++        if (message.find('\0') != std::string::npos) return std::nullopt;
+ 
+         utils::TextParse parser{ message };
+         if (log_config.print_message) {
+@@ -57,19 +92,13 @@ namespace packet {
+     }
+     case NET_MESSAGE_GAME_PACKET: {
+         GameUpdatePacket game_pkt{};
+-        stream.read(game_pkt);
+-
+-        const size_t extra_size = static_cast<size_t>(
+-             game_pkt.data_size > 0
+-                 ? game_pkt.data_size
+-                 : stream.get_size() - stream.get_read_offset()
+-        );
+-
+-        // Create a view of the extra data
+-        std::span<const std::byte> extra_view{
+-            data.data() + stream.get_read_offset(),
+-            stream.get_size() - stream.get_read_offset()
+-        };
++        if (!stream.read(game_pkt)) return std::nullopt;
++        if (observer_only && game_pkt.type!=PACKET_CALL_FUNCTION && game_pkt.type!=PACKET_SEND_INVENTORY_STATE &&
++            game_pkt.type!=PACKET_MODIFY_ITEM_INVENTORY && game_pkt.type!=PACKET_DISCONNECT) return std::nullopt;
++        const auto available = data.size() - stream.get_read_offset();
++        const auto extra_size = static_cast<std::size_t>(game_pkt.data_size);
++        if (extra_size != available) return std::nullopt;
++        const auto extra_view = data.subspan(stream.get_read_offset(), extra_size);
+ 
+         spdlog::info(
+             "{} with type of {}",
+@@ -89,9 +118,9 @@ namespace packet {
+             );
+         }
+ 
+-        stream.skip(extra_size);
+ 
+         if (game_pkt.type == PACKET_CALL_FUNCTION) {
++            if (!valid_variant(extra_view)) return std::nullopt;
+             PacketVariant variant{};
+             if (!variant.deserialize(extra_view)) {
+                 return std::nullopt;
+diff --git a/src/packet/packet_decoder.hpp b/src/packet/packet_decoder.hpp
+index c1723d5..a92187c 100644
+--- a/src/packet/packet_decoder.hpp
++++ b/src/packet/packet_decoder.hpp
+@@ -13,6 +13,8 @@
+ namespace packet {
+ class PacketDecoder {
+ public:
++    [[nodiscard]] static std::optional<std::shared_ptr<IPacket>> decode(
++        std::span<const std::byte>, const core::Config::LogConfig&, std::string_view, bool observer_only);
+     [[nodiscard]] static std::optional<std::shared_ptr<IPacket>> decode(
+         std::span<const std::byte> data,
+         const core::Config::LogConfig& log_config,
+diff --git a/src/ui/status_model.hpp b/src/ui/status_model.hpp
+new file mode 100644
+index 0000000..8396fd4
+--- /dev/null
++++ b/src/ui/status_model.hpp
+@@ -0,0 +1,22 @@
++#pragma once
++#include <string>
++#include "../core/connection_state.hpp"
++#include "../inventory/inventory_state.hpp"
++namespace ui {
++struct StatusView {std::wstring heading; std::wstring rows;};
++class StatusModel {
++public:
++    StatusView present(core::ConnectionState state,const inventory::InventorySnapshot& snapshot) const {
++        const auto label=state==core::ConnectionState::Connected ? L"Connected" : state==core::ConnectionState::Starting ? L"Starting" :
++            state==core::ConnectionState::Failed ? L"Connection failed" : state==core::ConnectionState::Disconnected ? L"Disconnected" : L"Stopped";
++        StatusView view{std::wstring{label}+L" | Inventory unavailable",{}};
++        if(state==core::ConnectionState::Connected && snapshot.status==inventory::InventoryStatus::Candidate) {
++            view.heading=std::wstring{label}+L" | UNVERIFIED candidate inventory";
++            view.rows=L"Item ID\tQuantity\r\n";
++            for(const auto& entry:snapshot.entries) view.rows+=std::to_wstring(entry.item_id)+L"\t"+std::to_wstring(entry.quantity)+L"\r\n";
++        }
++        if(snapshot.status==inventory::InventoryStatus::Stale) view.heading=std::wstring{label}+L" | Inventory stale; waiting for full refresh";
++        return view;
++    }
++};
++}
+diff --git a/src/ui/status_window.cpp b/src/ui/status_window.cpp
+new file mode 100644
+index 0000000..6211e1b
+--- /dev/null
++++ b/src/ui/status_window.cpp
+@@ -0,0 +1,77 @@
++#include "status_window.hpp"
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <chrono>
++#include <stdexcept>
++namespace ui {
++namespace {
++struct WindowContext {
++    inventory::InventoryState& inventory;
++    core::ConnectionStatus& connection;
++    bool smoke;
++    HWND heading{};
++    HWND rows{};
++    StatusModel model;
++    std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
++};
++LRESULT CALLBACK window_proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam)
++{
++    auto* context=reinterpret_cast<WindowContext*>(GetWindowLongPtrW(window,GWLP_USERDATA));
++    if(message==WM_NCCREATE) {
++        context=static_cast<WindowContext*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);
++        SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(context));
++    }
++    if(!context)return DefWindowProcW(window,message,wparam,lparam);
++    if(message==WM_CREATE) {
++        context->heading=CreateWindowW(L"STATIC",L"Starting read-only view",WS_CHILD|WS_VISIBLE,16,16,650,40,window,nullptr,nullptr,nullptr);
++        CreateWindowW(L"STATIC",L"Read-only candidate. No item dropping. Close this window to stop.",WS_CHILD|WS_VISIBLE,16,62,650,26,window,nullptr,nullptr,nullptr);
++        context->rows=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY,16,98,650,360,window,nullptr,nullptr,nullptr);
++        if(!context->heading || !context->rows)return -1;
++        SetTimer(window,1,100,nullptr);return 0;
++    }
++    if(message==WM_TIMER) {
++        const auto elapsed=std::chrono::steady_clock::now()-context->start;
++        if(context->smoke && elapsed>std::chrono::milliseconds{1700}) {
++            context->inventory.invalidate();context->connection.set(core::ConnectionState::Disconnected);
++        }
++        auto view=context->model.present(context->connection.get(),context->inventory.snapshot());
++        SetWindowTextW(context->heading,view.heading.c_str());SetWindowTextW(context->rows,view.rows.c_str());
++        if(context->smoke && elapsed>std::chrono::milliseconds{3200})PostMessageW(window,WM_CLOSE,0,0);
++        return 0;
++    }
++    if(message==WM_CLOSE) {context->connection.cancel();DestroyWindow(window);return 0;}
++    if(message==WM_DESTROY) {KillTimer(window,1);PostQuitMessage(0);return 0;}
++    return DefWindowProcW(window,message,wparam,lparam);
++}
++}
++int StatusWindow::run(inventory::InventoryState& inventory,core::ConnectionStatus& connection,bool smoke)
++{
++    const auto instance=GetModuleHandleW(nullptr);
++    const wchar_t* class_name=L"MarvProxReadOnlyWindow";
++    WNDCLASSW definition{};definition.lpfnWndProc=window_proc;definition.hInstance=instance;
++    definition.lpszClassName=class_name;definition.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(32512));
++    definition.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);
++    if(!RegisterClassW(&definition) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)throw std::runtime_error{"Window initialization failed"};
++    WindowContext context{inventory,connection,smoke};
++    const auto window=CreateWindowW(class_name,L"MarvProx - Read-only connection",WS_OVERLAPPEDWINDOW,
++        CW_USEDEFAULT,CW_USEDEFAULT,710,520,nullptr,nullptr,instance,&context);
++    if(!window)throw std::runtime_error{"Window initialization failed"};
++    ShowWindow(window,SW_SHOW);UpdateWindow(window);
++    MSG message{};
++    while(const auto result=GetMessageW(&message,nullptr,0,0)) {
++        if(result==-1){connection.cancel();DestroyWindow(window);return 1;}
++        TranslateMessage(&message);DispatchMessageW(&message);
++    }
++    connection.cancel();return 0;
++}
++}
++#else
++#include <stdexcept>
++int ui::StatusWindow::run(inventory::InventoryState&,core::ConnectionStatus&,bool){throw std::runtime_error{"Windows UI required"};}
++#endif
+diff --git a/src/ui/status_window.hpp b/src/ui/status_window.hpp
+new file mode 100644
+index 0000000..8c8a686
+--- /dev/null
++++ b/src/ui/status_window.hpp
+@@ -0,0 +1,9 @@
++#pragma once
++#include "status_model.hpp"
++namespace ui {
++// All window access stays on the main thread; snapshots are copied under their model lock.
++class StatusWindow {
++public:
++    int run(inventory::InventoryState&,core::ConnectionStatus&,bool smoke_test=false);
++};
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f7207d4..7de93ee 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -3,6 +3,12 @@ project(GTProxy_tests)
+ find_package(GTest REQUIRED)
+ 
+ add_executable(GTProxy_tests
++    core/test_inventory_state.cpp
++    core/test_connection_policy.cpp
++    core/test_status_snapshot.cpp
++    core/test_readonly_web.cpp
++    core/test_dns_answer.cpp
++    core/test_packet_bounds.cpp
+     core/test_probe_policy.cpp
+     core/test_forwarding.cpp
+     core/test_dispatcher.cpp
+diff --git a/tests/core/test_connection_policy.cpp b/tests/core/test_connection_policy.cpp
+new file mode 100644
+index 0000000..d3476c3
+--- /dev/null
++++ b/tests/core/test_connection_policy.cpp
+@@ -0,0 +1,35 @@
++#include <gtest/gtest.h>
++#include "core/connection_policy.hpp"
++#include "core/connection_state.hpp"
++
++TEST(ConnectionPolicy, OfflineCannotConnectEvenWithConfiguredHost)
++{
++    core::ConnectionPolicy policy;
++    EXPECT_FALSE(policy.allow_upstream());
++    EXPECT_FALSE(policy.permits_endpoint("1.1.1.1",17091));
++}
++TEST(ConnectionPolicy, RejectsUnrelatedHostAndInvalidTimeout)
++{
++    EXPECT_THROW(core::ConnectionPolicy::read_only("attacker.invalid",30),std::invalid_argument);
++    EXPECT_THROW(core::ConnectionPolicy::read_only("www.growtopia1.com",0),std::invalid_argument);
++    EXPECT_THROW(core::ConnectionPolicy::read_only("www.growtopia1.com",3601),std::invalid_argument);
++}
++TEST(ConnectionPolicy, ExplicitLiveModeAcceptsOnlyPublicNumericEndpoint)
++{
++    auto p=core::ConnectionPolicy::read_only("www.growtopia1.com",30);
++    EXPECT_TRUE(p.allow_upstream());
++    EXPECT_TRUE(p.permits_endpoint("1.1.1.1",17091));
++    for (auto host : {"127.0.0.1","10.0.0.1","192.168.1.1","169.254.1.2","172.16.1.1","100.64.0.1","0.0.0.0","224.1.1.1","198.18.0.1","192.0.2.1","localhost","1.1.1.1.evil","::1"})
++        EXPECT_FALSE(p.permits_endpoint(host,17091))<<host;
++    EXPECT_FALSE(p.permits_endpoint("1.1.1.1",0));
++    EXPECT_FALSE(p.permits_endpoint("1.1.1.1",65536));
++}
++TEST(ConnectionState, CancelAndTransitionsAreThreadSafe)
++{
++    core::ConnectionStatus state;
++    EXPECT_EQ(state.get(),core::ConnectionState::Stopped);
++    state.set(core::ConnectionState::Starting);
++    EXPECT_EQ(state.get(),core::ConnectionState::Starting);
++    state.cancel();
++    EXPECT_TRUE(state.cancelled());
++}
+diff --git a/tests/core/test_dns_answer.cpp b/tests/core/test_dns_answer.cpp
+new file mode 100644
+index 0000000..48f82a5
+--- /dev/null
++++ b/tests/core/test_dns_answer.cpp
+@@ -0,0 +1,9 @@
++#include <gtest/gtest.h>
++#include "network/dns_answer.hpp"
++TEST(VerifiedDns, UsesOnlySuccessfulPublicARecord)
++{
++    EXPECT_EQ(network::parse_dns_answer(R"({"Status":0,"Answer":[{"type":5,"data":"alias.invalid"},{"type":1,"data":"1.1.1.1"}]})"),"1.1.1.1");
++    EXPECT_TRUE(network::parse_dns_answer(R"({"Status":0,"Answer":[{"type":1,"data":"127.0.0.1"}]})").empty());
++    EXPECT_TRUE(network::parse_dns_answer(R"({"Status":2,"Answer":[{"type":1,"data":"1.1.1.1"}]})").empty());
++    EXPECT_TRUE(network::parse_dns_answer("{ SYNTHETIC_DNS_SECRET").empty());
++}
+diff --git a/tests/core/test_inventory_state.cpp b/tests/core/test_inventory_state.cpp
+new file mode 100644
+index 0000000..bbb2f1f
+--- /dev/null
++++ b/tests/core/test_inventory_state.cpp
+@@ -0,0 +1,123 @@
++#include <gtest/gtest.h>
++#include <thread>
++#include <cstring>
++#include "packet/packet_decoder.hpp"
++#include "packet/register_packets.hpp"
++#include "inventory/inventory_state.hpp"
++#include "core/handlers/inventory_handler.hpp"
++#include "packet/game/inventory.hpp"
++
++namespace {
++// Candidate layout only: v1, u32 capacity, u16 count, u16 ID/u8 count/u8 opaque flags.
++const std::vector<std::byte> sample{std::byte{1},std::byte{20},std::byte{0},std::byte{0},std::byte{0},std::byte{2},std::byte{0},
++ std::byte{100},std::byte{0},std::byte{12},std::byte{0},std::byte{101},std::byte{0},std::byte{1},std::byte{1}};
++}
++TEST(InventoryState, CompleteSnapshotRemainsCandidate)
++{
++    inventory::InventoryState state;
++    EXPECT_EQ(state.snapshot().status, inventory::InventoryStatus::Unavailable);
++    ASSERT_TRUE(state.accept_candidate(sample));
++    auto snapshot=state.snapshot();
++    EXPECT_EQ(snapshot.status, inventory::InventoryStatus::Candidate);
++    ASSERT_EQ(snapshot.entries.size(), 2);
++    EXPECT_EQ(snapshot.entries[0].item_id, 100);
++    EXPECT_EQ(snapshot.entries[0].quantity, 12);
++    EXPECT_EQ(snapshot.entries[1].quantity, 1);
++}
++TEST(InventoryState, EveryTruncationClearsOldSnapshot)
++{
++    inventory::InventoryState state;
++    for(std::size_t n=0;n<sample.size();++n) {
++        ASSERT_TRUE(state.accept_candidate(sample));
++        const auto generation=state.snapshot().generation;
++        EXPECT_FALSE(state.accept_candidate(std::span{sample}.first(n)));
++        EXPECT_TRUE(state.snapshot().entries.empty());
++        EXPECT_EQ(state.snapshot().status, inventory::InventoryStatus::Stale);
++        EXPECT_GT(state.snapshot().generation, generation);
++    }
++}
++TEST(InventoryState, RejectsUnknownDuplicateExcessAndTrailingRecords)
++{
++    inventory::InventoryState state;
++    auto bytes=sample; bytes[0]=std::byte{2}; EXPECT_FALSE(state.accept_candidate(bytes));
++    bytes=sample; bytes[5]=std::byte{255}; EXPECT_FALSE(state.accept_candidate(bytes));
++    bytes=sample; bytes[11]=std::byte{100}; EXPECT_FALSE(state.accept_candidate(bytes));
++    bytes=sample; bytes.push_back(std::byte{0}); EXPECT_FALSE(state.accept_candidate(bytes));
++    bytes=sample; bytes[1]=std::byte{1}; EXPECT_FALSE(state.accept_candidate(bytes));
++}
++TEST(InventoryState, ChangesAndConcurrentReadsNeverKeepOldEntries)
++{
++    inventory::InventoryState state;
++    std::thread writer([&]{for(int n=0;n<100;++n) {state.accept_candidate(sample);state.invalidate();}});
++    for(int n=0;n<100;++n) {auto s=state.snapshot();EXPECT_TRUE(s.entries.empty() || s.status==inventory::InventoryStatus::Candidate);}
++    writer.join();
++    EXPECT_TRUE(state.snapshot().entries.empty());
++}
++TEST(InventoryObserver, IgnoresWrongDirectionAndClearsOnHandoffDisconnect)
++{
++    event::Dispatcher dispatcher;
++    inventory::InventoryState state;
++    core::handlers::InventoryHandler observer(dispatcher,state);
++    auto packet=std::make_shared<packet::game::SendInventoryState>(); packet->extra=sample;
++    dispatcher.dispatch(event::TypedPacketEvent<packet::PacketId::SendInventoryState>{event::Direction::ServerBound,packet});
++    EXPECT_TRUE(state.snapshot().entries.empty());
++    dispatcher.dispatch(event::TypedPacketEvent<packet::PacketId::SendInventoryState>{event::Direction::ClientBound,packet});
++    ASSERT_EQ(state.snapshot().entries.size(),2);
++    dispatcher.dispatch(event::ConnectionEvent{event::Type::ServerDisconnect});
++    EXPECT_TRUE(state.snapshot().entries.empty());
++    state.accept_candidate(sample);
++    auto handoff=std::make_shared<packet::game::OnSendToServer>();
++    dispatcher.dispatch(event::TypedPacketEvent<packet::PacketId::OnSendToServer>{event::Direction::ClientBound,handoff});
++    EXPECT_TRUE(state.snapshot().entries.empty());
++}
++TEST(InventoryObserver, ForcedDisconnectClearsSnapshotAndConnectionState)
++{
++    event::Dispatcher dispatcher;inventory::InventoryState state;core::ConnectionStatus status;
++    status.set(core::ConnectionState::Connected);
++    core::handlers::InventoryHandler observer(dispatcher,state,&status);
++    state.accept_candidate(sample);
++    auto packet=std::make_shared<packet::game::Disconnect>();
++    dispatcher.dispatch(event::TypedPacketEvent<packet::PacketId::Disconnect>{event::Direction::ServerBound,packet});
++    EXPECT_TRUE(state.snapshot().entries.empty());
++    EXPECT_EQ(status.get(),core::ConnectionState::Disconnected);
++}
++TEST(InventoryObserver, RejectedCallFunctionInvalidatesBeforeRawForwarding)
++{
++    packet::register_all_packets();
++    event::Dispatcher dispatcher;inventory::InventoryState state;
++    core::handlers::InventoryHandler observer(dispatcher,state);
++    bool forwarded{};std::vector<std::byte> forwarded_bytes;
++    std::ignore=dispatcher.append_listener(event::Type::ClientBoundPacket,[&](const event::Event& e){
++        const auto* raw=dynamic_cast<const event::RawPacketEvent*>(&e);ASSERT_NE(raw,nullptr);
++        EXPECT_TRUE(state.snapshot().entries.empty());forwarded=true;
++        forwarded_bytes.assign(raw->data.begin(),raw->data.end());
++    });
++    const packet::PacketVariant unsupported{std::string{"OnSendToServer"},std::int32_t{17091}};
++    for(const auto& extra:std::vector<std::vector<std::byte>>{
++        {std::byte{1},std::byte{0},std::byte{2},std::byte{255},std::byte{255},std::byte{255},std::byte{127}},unsupported.serialize()}) {
++        state.accept_candidate(sample);forwarded=false;
++        const auto type=packet::NET_MESSAGE_GAME_PACKET;packet::GameUpdatePacket header{};
++        header.type=packet::PACKET_CALL_FUNCTION;header.data_size=static_cast<std::uint32_t>(extra.size());
++        std::vector<std::byte> bytes(sizeof(type)+sizeof(header)+extra.size());
++        std::memcpy(bytes.data(),&type,sizeof(type));std::memcpy(bytes.data()+sizeof(type),&header,sizeof(header));
++        std::copy(extra.begin(),extra.end(),bytes.end()-extra.size());
++        ASSERT_FALSE(packet::PacketDecoder::decode(bytes,{},"test",true));
++        dispatcher.dispatch(event::RawPacketEvent{event::Type::ClientBoundPacket,bytes});
++        EXPECT_TRUE(state.snapshot().entries.empty());EXPECT_TRUE(forwarded);EXPECT_EQ(forwarded_bytes,bytes);
++    }
++}
++TEST(InventoryObserver, ValidUnrelatedCallFunctionPreservesCandidate)
++{
++    packet::register_all_packets();
++    event::Dispatcher dispatcher;inventory::InventoryState state;
++    core::handlers::InventoryHandler observer(dispatcher,state);state.accept_candidate(sample);
++    const packet::PacketVariant value{std::string{"OnConsoleMessage"},std::string{"SYNTHETIC_NOTICE"}};
++    const auto extra=value.serialize();const auto type=packet::NET_MESSAGE_GAME_PACKET;
++    packet::GameUpdatePacket header{};header.type=packet::PACKET_CALL_FUNCTION;header.data_size=static_cast<std::uint32_t>(extra.size());
++    std::vector<std::byte> bytes(sizeof(type)+sizeof(header)+extra.size());
++    std::memcpy(bytes.data(),&type,sizeof(type));std::memcpy(bytes.data()+sizeof(type),&header,sizeof(header));
++    std::copy(extra.begin(),extra.end(),bytes.end()-extra.size());
++    ASSERT_TRUE(packet::PacketDecoder::decode(bytes,{},"test",true));
++    dispatcher.dispatch(event::RawPacketEvent{event::Type::ClientBoundPacket,bytes});
++    EXPECT_EQ(state.snapshot().entries.size(),2);
++}
+diff --git a/tests/core/test_packet_bounds.cpp b/tests/core/test_packet_bounds.cpp
+new file mode 100644
+index 0000000..44ae2bd
+--- /dev/null
++++ b/tests/core/test_packet_bounds.cpp
+@@ -0,0 +1,85 @@
++#include <gtest/gtest.h>
++#include <cstring>
++#include "packet/packet_decoder.hpp"
++#include "packet/register_packets.hpp"
++#include "packet/game/inventory.hpp"
++#include "packet/game/server.hpp"
++
++namespace {
++std::vector<std::byte> inventory_packet(std::uint32_t declared, std::size_t available)
++{
++    packet::GameUpdatePacket header{};
++    header.type = packet::PACKET_SEND_INVENTORY_STATE;
++    header.data_size = declared;
++    const auto type = packet::NET_MESSAGE_GAME_PACKET;
++    std::vector<std::byte> bytes(sizeof(type) + sizeof(header) + available);
++    std::memcpy(bytes.data(), &type, sizeof(type));
++    std::memcpy(bytes.data() + sizeof(type), &header, sizeof(header));
++    return bytes;
++}
++}
++TEST(PacketBounds, RejectsAllTruncatedGameHeaders)
++{
++    packet::register_all_packets();
++    auto bytes = inventory_packet(0, 0);
++    for (std::size_t size = 0; size < bytes.size(); ++size)
++        EXPECT_FALSE(packet::PacketDecoder::decode(std::span{bytes}.first(size), {}, "test")) << size;
++}
++TEST(PacketBounds, RejectsDeclaredExtraBeyondAvailableBytes)
++{
++    packet::register_all_packets();
++    EXPECT_FALSE(packet::PacketDecoder::decode(inventory_packet(1000, 3), {}, "test"));
++}
++TEST(PacketBounds, RejectsUnaccountedTrailingBytes)
++{
++    packet::register_all_packets();
++    EXPECT_FALSE(packet::PacketDecoder::decode(inventory_packet(2, 4), {}, "test"));
++    EXPECT_FALSE(packet::PacketDecoder::decode(inventory_packet(0, 4), {}, "test"));
++}
++TEST(PacketBounds, AcceptsExactInventoryEnvelope)
++{
++    packet::register_all_packets();
++    const auto result = packet::PacketDecoder::decode(inventory_packet(3, 3), {}, "test");
++    ASSERT_TRUE(result);
++    const auto parsed = std::dynamic_pointer_cast<packet::game::SendInventoryState>(*result);
++    ASSERT_NE(parsed, nullptr);
++    EXPECT_EQ(parsed->extra.size(), 3);
++}
++TEST(PacketBounds, RejectsOversizedAndUnterminatedText)
++{
++    const auto type = packet::NET_MESSAGE_GENERIC_TEXT;
++    std::vector<std::byte> bytes(70000, std::byte{'x'});
++    std::memcpy(bytes.data(), &type, sizeof(type));
++    bytes.back() = std::byte{0};
++    EXPECT_FALSE(packet::PacketDecoder::decode(bytes, {}, "test"));
++    bytes.resize(sizeof(type));
++    EXPECT_FALSE(packet::PacketDecoder::decode(bytes, {}, "test"));
++}
++TEST(PacketBounds, ObserverSkipsUnneededGameParsers)
++{
++    auto bytes=inventory_packet(0,0);
++    bytes[4]=std::byte{16};
++    EXPECT_FALSE(packet::PacketDecoder::decode(bytes,{},"test",true));
++}
++TEST(PacketBounds, MalformedVariantsNeverBecomePlausibleHandoffs)
++{
++    for (const auto& extra:std::vector<std::vector<std::byte>>{
++        {std::byte{1},std::byte{0},std::byte{2},std::byte{255},std::byte{255},std::byte{255},std::byte{127}},
++        {std::byte{1},std::byte{7},std::byte{5},std::byte{1},std::byte{0},std::byte{0},std::byte{0}}}) {
++        auto bytes=inventory_packet(static_cast<std::uint32_t>(extra.size()),extra.size());
++        bytes[4]=std::byte{1};
++        std::copy(extra.begin(),extra.end(),bytes.end()-extra.size());
++        EXPECT_FALSE(packet::PacketDecoder::decode(bytes,{},"test",true));
++    }
++}
++TEST(PacketBounds, HandoffPreservesOpaqueSuffixAndAdditionalFields)
++{
++    packet::PacketVariant value{std::string{"OnSendToServer"},std::int32_t{17091},std::int32_t{1},std::int32_t{2},
++        std::string{"1.1.1.1|SYNTHETIC_DOOR|SYNTHETIC_SESSION|SYNTHETIC_EXTRA"},std::uint32_t{0},std::string{"SYNTHETIC_USER"},std::string{"SYNTHETIC_TOP_EXTRA"}};
++    packet::Payload input=packet::VariantPayload{packet::GameUpdatePacket{},value};
++    packet::game::OnSendToServer handoff;ASSERT_TRUE(handoff.read(input));
++    handoff.address="127.0.0.1";handoff.port=16999;
++    const auto output=handoff.write();const auto* updated=std::get_if<packet::VariantPayload>(&output);ASSERT_NE(updated,nullptr);
++    EXPECT_EQ(updated->variant.get<std::string>(4),"127.0.0.1|SYNTHETIC_DOOR|SYNTHETIC_SESSION|SYNTHETIC_EXTRA");
++    EXPECT_EQ(updated->variant.get<std::string>(7),"SYNTHETIC_TOP_EXTRA");
++}
+diff --git a/tests/core/test_readonly_web.cpp b/tests/core/test_readonly_web.cpp
+new file mode 100644
+index 0000000..3c056a6
+--- /dev/null
++++ b/tests/core/test_readonly_web.cpp
+@@ -0,0 +1,85 @@
++#include <gtest/gtest.h>
++#include <sstream>
++#include <future>
++#include "core/verified_upstream.hpp"
++#include <spdlog/sinks/ostream_sink.h>
++#include "core/web_server.hpp"
++#include "core/probe_sink.hpp"
++#include "network/enet_runtime.hpp"
++#include "test_workspace.hpp"
++
++TEST(ReadOnlyWeb, ForwardsToLocalTlsFixtureAndValidatesReturnedRoute)
++{
++    TestWorkspace workspace;workspace.certificates();
++    network::ENetRuntime networking;
++    const int port=available_test_port();workspace.configure(port);
++    core::Config config;
++    event::Dispatcher dispatcher;
++    network::Server game(config,dispatcher);
++    network::Client client(config,dispatcher);
++    auto policy=core::ConnectionPolicy::read_only("www.growtopia1.com",30);
++    const auto certificate=std::filesystem::path{std::getenv("MARVPROX_TEST_CERT_DIR")};
++    httplib::SSLServer fixture{(certificate/"cert.pem").string().c_str(),(certificate/"key.pem").string().c_str()};
++    std::atomic<bool> private_route{};std::atomic<int> received{};
++    fixture.Post("/growtopia/server_data.php",[&](const httplib::Request& request,httplib::Response& response){
++        if(request.body=="SYNTHETIC_BODY_SECRET")++received;
++        response.set_content(private_route ? "server|127.0.0.1\nport|17091\n" : "server|1.1.1.1\nport|17091\n","text/plain");
++    });
++    const int upstream_port=fixture.bind_to_any_port("127.0.0.1");ASSERT_GT(upstream_port,0);
++    std::jthread upstream_thread([&]{fixture.listen_after_bind();});
++    fixture.wait_until_ready();
++    struct StopFixture {httplib::SSLServer& fixture;~StopFixture(){fixture.stop();}} stop{fixture};
++    std::ostringstream output;
++    auto sink=std::make_shared<spdlog::sinks::ostream_sink_mt>(output);sink->set_pattern("%v");
++    auto logger=std::make_shared<spdlog::logger>("readonly-web",std::make_shared<core::ProbeSink>(sink));
++    auto previous=spdlog::default_logger();spdlog::set_default_logger(logger);
++    struct Restore {std::shared_ptr<spdlog::logger> logger;~Restore(){spdlog::set_default_logger(logger);}} restore{previous};
++    {
++        core::WebServer web(config,dispatcher,client,game,policy,[&](const httplib::Request& request)->std::optional<std::string>{
++            httplib::SSLClient upstream{"127.0.0.1",upstream_port};
++            upstream.set_ca_cert_path((certificate/"cert.pem").string());upstream.set_connection_timeout(3,0);upstream.set_read_timeout(3,0);
++            const auto result=upstream.Post("/growtopia/server_data.php",request.body,"text/plain");
++            if(!result || result->status!=200)return std::nullopt;return result->body;
++        });
++        httplib::SSLClient local{"127.0.0.1",port};
++        local.set_ca_cert_path((certificate/"cert.pem").string());local.set_connection_timeout(3,0);local.set_read_timeout(3,0);
++        const auto response=local.Post("/growtopia/server_data.php",httplib::Headers{{"Authorization","SYNTHETIC_HEADER_SECRET"},{"Host","attacker.invalid"}},"SYNTHETIC_BODY_SECRET","text/plain");
++        ASSERT_TRUE(response);EXPECT_EQ(response->status,200);EXPECT_NE(response->body.find("server|127.0.0.1"),std::string::npos);EXPECT_EQ(received.load(),1);
++        private_route=true;
++        const auto rejected=local.Post("/growtopia/server_data.php","SYNTHETIC_BODY_SECRET","text/plain");
++        ASSERT_TRUE(rejected);EXPECT_EQ(rejected->status,502);
++    }
++    logger->flush();EXPECT_TRUE(output.str().empty());
++}
++TEST(ReadOnlyWeb, ClosingWithStalledUpstreamHonorsRequestTimeout)
++{
++    TestWorkspace workspace;workspace.certificates();network::ENetRuntime networking;
++    const int port=available_test_port();workspace.configure(port);core::Config config;
++    event::Dispatcher dispatcher;network::Server game(config,dispatcher);network::Client client(config,dispatcher);
++    const auto certificate=std::filesystem::path{std::getenv("MARVPROX_TEST_CERT_DIR")};
++    httplib::SSLServer fixture{(certificate/"cert.pem").string().c_str(),(certificate/"key.pem").string().c_str()};
++    std::promise<void> arrived;auto ready=arrived.get_future();std::atomic<bool> release{};
++    fixture.Get("/",[&](const auto&,auto& response){
++        arrived.set_value();const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{10};
++        while(!release && std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds{10});
++        response.set_content("server|1.1.1.1\nport|17091\n","text/plain");
++    });
++    const int upstream_port=fixture.bind_to_any_port("127.0.0.1");ASSERT_GT(upstream_port,0);
++    std::jthread fixture_thread([&]{fixture.listen_after_bind();});fixture.wait_until_ready();
++    struct StopFixture {std::atomic<bool>& release;httplib::SSLServer& fixture;~StopFixture(){release=true;fixture.stop();}} stop{release,fixture};
++    auto web=std::make_unique<core::WebServer>(config,dispatcher,client,game,
++        core::ConnectionPolicy::read_only("www.growtopia1.com",30),[&](const auto&)->std::optional<std::string>{
++            auto upstream=core::make_verified_upstream("127.0.0.1",upstream_port);
++            upstream->set_ca_cert_path((certificate/"cert.pem").string());
++            const auto response=upstream->Get("/");if(!response)return std::nullopt;return response->body;
++        });
++    std::jthread request([&]{
++        httplib::SSLClient local{"127.0.0.1",port};local.set_ca_cert_path((certificate/"cert.pem").string());
++        local.set_connection_timeout(3,0);local.set_read_timeout(8,0);
++        const auto result=local.Post("/growtopia/server_data.php","SYNTHETIC_STALLED_REQUEST","text/plain");
++    });
++    ASSERT_EQ(ready.wait_for(std::chrono::seconds{5}),std::future_status::ready);
++    const auto before=std::chrono::steady_clock::now();web.reset();
++    EXPECT_LT(std::chrono::steady_clock::now()-before,std::chrono::seconds{7});
++    release=true;request.join();
++}
+diff --git a/tests/core/test_status_snapshot.cpp b/tests/core/test_status_snapshot.cpp
+new file mode 100644
+index 0000000..299edb8
+--- /dev/null
++++ b/tests/core/test_status_snapshot.cpp
+@@ -0,0 +1,21 @@
++#include <gtest/gtest.h>
++#include "ui/status_model.hpp"
++
++TEST(StatusSnapshot, LabelsCandidateAndNeverAddsGameplayControl)
++{
++    ui::StatusModel model;
++    inventory::InventorySnapshot candidate{1,inventory::InventoryStatus::Candidate,{{100,12}}};
++    auto view=model.present(core::ConnectionState::Connected,candidate);
++    EXPECT_NE(view.heading.find(L"UNVERIFIED"),std::wstring::npos);
++    EXPECT_NE(view.rows.find(L"100"),std::wstring::npos);
++    auto disconnected=model.present(core::ConnectionState::Disconnected,candidate);
++    EXPECT_TRUE(disconnected.rows.empty());
++}
++TEST(StatusSnapshot, StaleAndUnavailableNeverShowInventory)
++{
++    ui::StatusModel model;
++    for(auto status:{inventory::InventoryStatus::Unavailable,inventory::InventoryStatus::Stale}) {
++        auto view=model.present(core::ConnectionState::Connected,{2,status,{{100,12}}});
++        EXPECT_TRUE(view.rows.empty());
++    }
++}

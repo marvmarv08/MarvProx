@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/ZTzTopia/GTProxy.git",
+  "commit": "f51c5a3d66ed52af08e2dec8d0459876bc102e75",
+  "license": "MIT",
+  "license_sha256": "13ac611e7b068466e23e7a722a0dc5326fb1ba6680b00f11228186cad34232fb",
+  "submodules": [
+    {
+      "path": "cmake/cmake-conan",
+      "repository": "https://github.com/conan-io/cmake-conan",
+      "commit": "162e1b8ab329549e1ddf6e871f464d77bef1330d"
+    },
+    {
+      "path": "lib/cpp-httplib",
+      "repository": "https://github.com/yhirose/cpp-httplib",
+      "commit": "2867b74f131200979b2b885683a189248d80e0f4"
+    },
+    {
+      "path": "lib/enet",
+      "repository": "https://github.com/ZTzTopia/enet",
+      "commit": "1b84a0100bcb7436d665b22edc605c3a32ad2350"
+    }
+  ],
+  "tool_versions": {
+    "git": "git version 2.53.0",
+    "windows_toolchain": {
+      "python": "3.13.16",
+      "conan": "2.33.0",
+      "cmake": "3.31.8",
+      "msvc": "19.44.35229.0",
+      "visual_studio": "17.14.42"
+    }
+  }
+}

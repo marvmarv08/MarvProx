@@ -1,0 +1,1223 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 03a03f9..69781d4 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -32,7 +32,8 @@ file(GLOB GTPROXY_SOURCE_FILES
+     utils/*.cpp
+     world/*.cpp)
+ 
+-add_executable(${PROJECT_NAME}
++list(REMOVE_ITEM GTPROXY_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
++add_library(GTProxy_core STATIC
+     ${GTPROXY_INCLUDE_FILES}
+     ${GTPROXY_SOURCE_FILES})
+ 
+@@ -49,7 +50,7 @@ find_package(sol2 REQUIRED)
+ find_package(spdlog REQUIRED)
+ find_package(ZLIB REQUIRED)
+ 
+-target_link_libraries(${PROJECT_NAME}
++target_link_libraries(GTProxy_core PUBLIC
+     enet
+     eventpp::eventpp
+     fmt::fmt
+@@ -65,37 +66,41 @@ target_link_libraries(${PROJECT_NAME}
+     spdlog::spdlog
+     ZLIB::ZLIB)
+ 
+-target_include_directories(${PROJECT_NAME} PRIVATE
++target_include_directories(GTProxy_core PUBLIC
+     ${CMAKE_SOURCE_DIR}/lib/enet/include)
+ 
+-target_include_directories(${PROJECT_NAME} PRIVATE
++target_include_directories(GTProxy_core PUBLIC
+     ${CMAKE_SOURCE_DIR}/lib/libressl/include)
+ 
+ if (MSVC)
+-    target_compile_options(${PROJECT_NAME} PRIVATE 
++    target_compile_options(GTProxy_core PUBLIC
+         /EHsc
+-        /bigobj)
++        /utf-8
++        PRIVATE /bigobj /MP2)
+ else ()
+-    target_compile_options(${PROJECT_NAME} PRIVATE
++    target_compile_options(GTProxy_core PRIVATE
+         -fexceptions)
+ endif ()
+ 
+-target_compile_definitions(${PROJECT_NAME} PUBLIC
++target_compile_definitions(GTProxy_core PUBLIC
+     NOMINMAX
+     WIN32_LEAN_AND_MEAN
+     SPDLOG_FMT_EXTERNAL
+     CPPHTTPLIB_OPENSSL_SUPPORT)
+ 
+-target_compile_definitions(${PROJECT_NAME} PRIVATE
++target_compile_definitions(GTProxy_core PUBLIC
+     GTPROXY_VERSION_MAJOR=${CMAKE_PROJECT_VERSION_MAJOR}
+     GTPROXY_VERSION_MINOR=${CMAKE_PROJECT_VERSION_MINOR}
+     GTPROXY_VERSION_PATCH=${CMAKE_PROJECT_VERSION_PATCH})
+ 
+ if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "" OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+-    target_compile_definitions(${PROJECT_NAME} PRIVATE
++    target_compile_definitions(GTProxy_core PUBLIC
+         GTPROXY_DEBUG)
+ endif ()
+ 
++add_executable(${PROJECT_NAME} main.cpp)
++target_link_libraries(${PROJECT_NAME} PRIVATE GTProxy_core)
++
+ add_custom_command(
+     TARGET ${PROJECT_NAME} POST_BUILD
+     COMMAND ${CMAKE_COMMAND} -E copy_directory
+diff --git a/src/core/config.cpp b/src/core/config.cpp
+index 110e833..ed388e5 100644
+--- a/src/core/config.cpp
++++ b/src/core/config.cpp
+@@ -24,7 +24,7 @@ Config::Config()
+         return;
+     }
+ 
+-    // TODO: Add missing keys when new fields are added
++    config_.log = { false, false, false, false };
+ 
+     spdlog::info("Config file \"config.json\" is all loaded up and ready to go!");
+ }
+diff --git a/src/core/config.hpp b/src/core/config.hpp
+index 0537d47..b72a85c 100644
+--- a/src/core/config.hpp
++++ b/src/core/config.hpp
+@@ -6,6 +6,7 @@ class Config {
+ public:
+     struct ServerConfig {
+         int port{ 16999 };
++        int web_port{ 18443 };
+         std::string address{ "www.growtopia1.com" };
+     };
+ 
+@@ -16,10 +17,10 @@ public:
+     };
+ 
+     struct LogConfig {
+-        bool print_message{ true };
++        bool print_message{ false };
+         bool print_game_update_packet{ false };
+-        bool print_variant{ true };
+-        bool print_extra{ true };
++        bool print_variant{ false };
++        bool print_extra{ false };
+     };
+ 
+     struct CommandConfig {
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index 4dd3d5e..e1ffcd5 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -1,4 +1,5 @@
+ #include "core.hpp"
++#include "probe_policy.hpp"
+ 
+ #include <chrono>
+ #include <thread>
+@@ -17,56 +18,56 @@
+ #include "../scripting/bindings/item_bindings.hpp"
+ 
+ namespace core {
+-Core::Core()
++Core::Core() : Core(std::function<void()>{}) { }
++
++Core::Core(std::function<void()> after_listeners_ready)
+     : running_{ true }
+     , scheduler_{ std::make_shared<Scheduler>() }
+ {
+-    if (enet_initialize() != 0) {
+-        throw std::runtime_error{ "Failed to initialize ENet" };
+-    }
+-
+     server_ = std::make_unique<network::Server>(config_, dispatcher_);
+     client_ = std::make_unique<network::Client>(config_, dispatcher_);
+     web_server_ = std::make_unique<WebServer>(config_, dispatcher_, *client_, *server_);
++    // Allows a local fault-injection test after real listeners exist.
++    if (after_listeners_ready) after_listeners_ready();
+ 
+     packet::register_all_packets();
+ 
+     connection_handler_ = std::make_unique<handlers::ConnectionHandler>(dispatcher_, *client_, *server_, config_);
+     forwarding_handler_ = std::make_unique<handlers::ForwardingHandler>(dispatcher_, *client_, *server_);
+     world_handler_ = std::make_unique<handlers::WorldHandler>(dispatcher_);
+-    command_handler_ = std::make_unique<command::CommandHandler>(config_, dispatcher_, scheduler_, *server_, *client_);
+-
+-    script_engine_ = std::make_unique<scripting::LuaEngine>();
+-
+-    script_scheduler_ = std::make_unique<scripting::ScriptScheduler>(*script_engine_);
+-
+-    script_event_bridge_ = std::make_unique<scripting::ScriptEventBridge>(
+-        dispatcher_,
+-        *script_engine_,
+-        *client_,
+-        *server_
+-    );
+-
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::CommandBindings>(*command_handler_, *server_, *client_, dispatcher_, scheduler_));
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::EventBindings>(*script_event_bridge_));
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::LoggerBindings>());
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::PacketBindings>(*client_, *server_));
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::SchedulerBindings>(*script_scheduler_));
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::PlayerBindings>());
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::WorldBindings>());
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::WorldDataBindings>());
+-    script_engine_->register_binding(std::make_unique<scripting::bindings::ItemBindings>());
+-
+-    script_loader_ = std::make_unique<scripting::ScriptLoader>(*script_engine_, "scripts");
+-    script_loader_->load_all();
++    ProbePolicy::initialize_extensions([&] {
++        command_handler_ = std::make_unique<command::CommandHandler>(config_, dispatcher_, scheduler_, *server_, *client_);
++    }, [&] {
++
++        script_engine_ = std::make_unique<scripting::LuaEngine>();
++
++        script_scheduler_ = std::make_unique<scripting::ScriptScheduler>(*script_engine_);
++
++        script_event_bridge_ = std::make_unique<scripting::ScriptEventBridge>(
++            dispatcher_,
++            *script_engine_,
++            *client_,
++            *server_
++        );
++
++        script_engine_->register_binding(std::make_unique<scripting::bindings::CommandBindings>(*command_handler_, *server_, *client_, dispatcher_, scheduler_));
++        script_engine_->register_binding(std::make_unique<scripting::bindings::EventBindings>(*script_event_bridge_));
++        script_engine_->register_binding(std::make_unique<scripting::bindings::LoggerBindings>());
++        script_engine_->register_binding(std::make_unique<scripting::bindings::PacketBindings>(*client_, *server_));
++        script_engine_->register_binding(std::make_unique<scripting::bindings::SchedulerBindings>(*script_scheduler_));
++        script_engine_->register_binding(std::make_unique<scripting::bindings::PlayerBindings>());
++        script_engine_->register_binding(std::make_unique<scripting::bindings::WorldBindings>());
++        script_engine_->register_binding(std::make_unique<scripting::bindings::WorldDataBindings>());
++        script_engine_->register_binding(std::make_unique<scripting::bindings::ItemBindings>());
++
++        script_loader_ = std::make_unique<scripting::ScriptLoader>(*script_engine_, "scripts");
++        script_loader_->load_all();
++    });
+ 
+     spdlog::info("Core initialized successfully");
+ }
+ 
+-Core::~Core()
+-{
+-    enet_deinitialize();
+-}
++Core::~Core() = default;
+ 
+ void Core::run() const
+ {
+@@ -83,7 +84,7 @@ void Core::run() const
+ 
+         server_->process();
+         client_->process();
+-        script_scheduler_->update(elapsed);
++        if (script_scheduler_) script_scheduler_->update(elapsed);
+ 
+         if (sleep_duration > std::chrono::microseconds::zero()) {
+             std::this_thread::sleep_for(sleep_duration);
+@@ -94,4 +95,14 @@ void Core::run() const
+         }
+     }
+ }
++
++void Core::run_for(std::chrono::milliseconds duration) const
++{
++    const auto deadline = std::chrono::steady_clock::now() + duration;
++    while (running_ && std::chrono::steady_clock::now() < deadline) {
++        server_->process();
++        client_->process();
++        std::this_thread::sleep_for(std::chrono::milliseconds{ 2 });
++    }
++}
+ }
+diff --git a/src/core/core.hpp b/src/core/core.hpp
+index 6d4a94a..04985de 100644
+--- a/src/core/core.hpp
++++ b/src/core/core.hpp
+@@ -1,4 +1,6 @@
+ #pragma once
++#include <chrono>
++#include <functional>
+ #include "config.hpp"
+ #include "scheduler.hpp"
+ #include "web_server.hpp"
+@@ -7,6 +9,7 @@
+ #include "handlers/world_handler.hpp"
+ #include "../command/command_handler.hpp"
+ #include "../network/client.hpp"
++#include "../network/enet_runtime.hpp"
+ #include "../network/server.hpp"
+ #include "../scripting/lua_engine.hpp"
+ #include "../scripting/script_event_bridge.hpp"
+@@ -18,14 +21,18 @@ namespace core {
+ class Core final : public utils::types::Immobile {
+ public:
+     Core();
++    explicit Core(std::function<void()> after_listeners_ready);
+     ~Core();
+ 
+     void run() const;
++    void run_for(std::chrono::milliseconds duration) const;
+     void stop() { running_ = false; }
+ 
+     [[nodiscard]] Config& get_config() { return config_; }
+ 
+ private:
++    // Declared first so ENet outlives every socket and listener during unwinding.
++    network::ENetRuntime enet_runtime_;
+     Config config_;
+     bool running_;
+ 
+diff --git a/src/core/handlers/connection_handler.cpp b/src/core/handlers/connection_handler.cpp
+index 8cae92b..8027dce 100644
+--- a/src/core/handlers/connection_handler.cpp
++++ b/src/core/handlers/connection_handler.cpp
+@@ -14,6 +14,7 @@ ConnectionHandler::ConnectionHandler(
+     , client_{ client }
+     , server_{ server }
+     , config_{ config }
++    , pending_port_{ 65535 }
+ {
+     setup_connection_handlers();
+     setup_on_send_to_server_handler();
+diff --git a/src/core/handlers/forwarding_handler.cpp b/src/core/handlers/forwarding_handler.cpp
+index 52c1414..8927239 100644
+--- a/src/core/handlers/forwarding_handler.cpp
++++ b/src/core/handlers/forwarding_handler.cpp
+@@ -3,8 +3,8 @@
+ namespace core::handlers {
+ ForwardingHandler::ForwardingHandler(
+     event::Dispatcher& dispatcher,
+-    network::Client& client,
+-    network::Server& server
++    const network::IConnection& client,
++    const network::IConnection& server
+ )
+     : dispatcher_{ dispatcher }
+     , client_{ client }
+diff --git a/src/core/handlers/forwarding_handler.hpp b/src/core/handlers/forwarding_handler.hpp
+index 263607f..18d5797 100644
+--- a/src/core/handlers/forwarding_handler.hpp
++++ b/src/core/handlers/forwarding_handler.hpp
+@@ -10,8 +10,8 @@ class ForwardingHandler {
+ public:
+     ForwardingHandler(
+         event::Dispatcher& dispatcher,
+-        network::Client& client,
+-        network::Server& server
++        const network::IConnection& client,
++        const network::IConnection& server
+     );
+ 
+ private:
+@@ -19,8 +19,8 @@ private:
+ 
+ private:
+     event::Dispatcher& dispatcher_;
+-    network::Client& client_;
+-    network::Server& server_;
++    const network::IConnection& client_;
++    const network::IConnection& server_;
+ 
+     std::vector<event::ScopedHandle> handles_;
+ };
+diff --git a/src/core/probe_policy.hpp b/src/core/probe_policy.hpp
+new file mode 100644
+index 0000000..16351f0
+--- /dev/null
++++ b/src/core/probe_policy.hpp
+@@ -0,0 +1,19 @@
++#pragma once
++#include <utility>
++
++namespace core {
++struct ProbePolicy {
++    [[nodiscard]] static constexpr bool allow_commands() { return false; }
++    [[nodiscard]] static constexpr bool allow_scripts() { return false; }
++    [[nodiscard]] static constexpr bool allow_payload_logging() { return false; }
++    [[nodiscard]] static constexpr bool allow_upstream_connections() { return false; }
++    [[nodiscard]] static constexpr const char* listen_address() { return "127.0.0.1"; }
++
++    template<typename Commands, typename Scripts>
++    static void initialize_extensions(Commands&& commands, Scripts&& scripts)
++    {
++        if (allow_commands()) std::forward<Commands>(commands)();
++        if (allow_scripts()) std::forward<Scripts>(scripts)();
++    }
++};
++}
+diff --git a/src/core/probe_sink.hpp b/src/core/probe_sink.hpp
+new file mode 100644
+index 0000000..293b92a
+--- /dev/null
++++ b/src/core/probe_sink.hpp
+@@ -0,0 +1,43 @@
++#pragma once
++#include <mutex>
++#include <string_view>
++#include <spdlog/spdlog.h>
++#include <spdlog/sinks/base_sink.h>
++
++namespace core {
++enum class ProbeEvent { Starting, Ready, StartupFailed, Stopped };
++
++inline std::string_view probe_event_name(ProbeEvent event)
++{
++    switch (event) {
++    case ProbeEvent::Starting: return "probe.starting";
++    case ProbeEvent::Ready: return "probe.ready";
++    case ProbeEvent::StartupFailed: return "probe.startup_failed";
++    case ProbeEvent::Stopped: return "probe.stopped";
++    }
++    return "probe.startup_failed";
++}
++
++class ProbeSink final : public spdlog::sinks::base_sink<std::mutex> {
++public:
++    explicit ProbeSink(spdlog::sink_ptr destination) : destination_{ std::move(destination) } { }
++private:
++    void sink_it_(const spdlog::details::log_msg& message) override
++    {
++        const std::string_view content{ message.payload.data(), message.payload.size() };
++        for (const auto event : { ProbeEvent::Starting, ProbeEvent::Ready, ProbeEvent::StartupFailed, ProbeEvent::Stopped }) {
++            if (content == probe_event_name(event)) {
++                destination_->log(message);
++                return;
++            }
++        }
++    }
++    void flush_() override { destination_->flush(); }
++    spdlog::sink_ptr destination_;
++};
++
++inline void emit_probe_event(ProbeEvent event)
++{
++    spdlog::info("{}", probe_event_name(event));
++}
++}
+diff --git a/src/core/verified_upstream.hpp b/src/core/verified_upstream.hpp
+new file mode 100644
+index 0000000..246d05b
+--- /dev/null
++++ b/src/core/verified_upstream.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++#include <memory>
++#include <string>
++#include <httplib.h>
++
++namespace core {
++inline std::unique_ptr<httplib::SSLClient> make_verified_upstream(const std::string& hostname, int port = 443)
++{
++    auto client = std::make_unique<httplib::SSLClient>(hostname, port);
++    client->enable_server_certificate_verification(true);
++    client->set_connection_timeout(3, 0);
++    client->set_read_timeout(3, 0);
++    client->set_write_timeout(3, 0);
++    return client;
++}
++}
+diff --git a/src/core/web_server.cpp b/src/core/web_server.cpp
+index 5c543bc..e29a9f4 100644
+--- a/src/core/web_server.cpp
++++ b/src/core/web_server.cpp
+@@ -1,4 +1,6 @@
+ #include "web_server.hpp"
++#include "probe_policy.hpp"
++#include "verified_upstream.hpp"
+ 
+ #include <fmt/format.h>
+ #include <magic_enum/magic_enum.hpp>
+@@ -25,22 +27,35 @@ WebServer::WebServer(
+ {
+     setup_server();
+ 
+-    if (!https_server_.bind_to_port("0.0.0.0", 443)) {
+-        spdlog::error("Failed to bind to port 443");
+-        return;
++    if (!https_server_.is_valid()) {
++        throw std::runtime_error{ "Probe TLS certificate unavailable" };
+     }
+ 
+-    dispatcher_.appendListener(event::Type::ClientConnect, [this](const event::Event& e) { on_client_connect(e); });
+-    dispatcher_.appendListener(event::Type::ClientDisconnect, [this](const event::Event& e) { on_client_disconnect(e); });
++    if (!https_server_.bind_to_port(ProbePolicy::listen_address(), config_.get_server_config().web_port)) {
++        throw std::runtime_error{ "Probe HTTPS port unavailable" };
++    }
+ 
+-    spdlog::info("HTTPS server listening on port 443");
+-    server_thread_ = std::thread{ &WebServer::listen_internal, this };
++    handles_.reserve(2);
++    handles_.emplace_back(dispatcher_, event::Type::ClientConnect,
++        dispatcher_.append_listener(event::Type::ClientConnect, [this](const event::Event& e) { on_client_connect(e); }));
++    handles_.emplace_back(dispatcher_, event::Type::ClientDisconnect,
++        dispatcher_.append_listener(event::Type::ClientDisconnect, [this](const event::Event& e) { on_client_disconnect(e); }));
++
++    server_thread_ = std::thread{ [this] {
++        try { listen_internal(); }
++        catch (...) { https_server_.decommission(); }
++    } };
++    https_server_.wait_until_ready();
++    if (!https_server_.is_running()) {
++        if (server_thread_.joinable()) server_thread_.join();
++        throw std::runtime_error{ "Probe HTTPS listener failed" };
++    }
+ }
+ 
+ WebServer::~WebServer()
+ {
+     https_server_.stop();
+-    server_thread_.join();
++    if (server_thread_.joinable()) server_thread_.join();
+ }
+ 
+ void WebServer::setup_server()
+@@ -50,6 +65,7 @@ void WebServer::setup_server()
+     });
+ 
+     https_server_.set_error_handler([](const httplib::Request&, httplib::Response& res) {
++        if (!res.body.empty()) return;
+         res.set_content(
+             fmt::format("{} ({})", httplib::status_message(res.status), res.status),
+             "text/plain"
+@@ -76,6 +92,11 @@ void WebServer::listen_internal()
+         const httplib::Request& req,
+         httplib::Response& res
+     ) -> bool {
++        if (!ProbePolicy::allow_upstream_connections()) {
++            res.status = 503;
++            res.set_content("Offline probe: upstream connections are disabled", "text/plain");
++            return true;
++        }
+         if (!req.headers.empty()) {
+             spdlog::info("Headers:");
+             for (const auto& [key, value] : req.headers) {
+@@ -94,23 +115,20 @@ void WebServer::listen_internal()
+         }
+ 
+         std::string server_address = config_.get_server_config().address;
+-        std::string resolved_ip = dns_resolver_.resolve_ip(server_address);
+-
+-        if (resolved_ip.empty()) {
++        if (server_address.empty()) {
+             res.status = 500;
+             res.set_content("Failed to resolve server address", "text/plain");
+             return true;
+         }
+ 
+-        httplib::Client cli{ fmt::format("https://{}", resolved_ip) };
+-        cli.enable_server_certificate_verification(false);
++        auto cli = make_verified_upstream(server_address);
+ 
+         httplib::Headers headers{
+             { "User-Agent", req.get_header_value("User-Agent") },
+             { "Host", server_address }
+         };
+ 
+-        httplib::Result response{ cli.Post("/growtopia/server_data.php", headers, req.params) };
++        httplib::Result response{ cli->Post("/growtopia/server_data.php", headers, req.params) };
+         if (!response) {
+             spdlog::error(
+                 "Response is null: httplib::Error::{}",
+diff --git a/src/core/web_server.hpp b/src/core/web_server.hpp
+index 6b1c447..81353bd 100644
+--- a/src/core/web_server.hpp
++++ b/src/core/web_server.hpp
+@@ -38,5 +38,6 @@ private:
+ 
+     std::string pending_address_;
+     uint16_t pending_port_;
++    std::vector<event::ScopedHandle> handles_;
+ };
+ }
+diff --git a/src/event/event.hpp b/src/event/event.hpp
+index 19f1df9..26b436c 100644
+--- a/src/event/event.hpp
++++ b/src/event/event.hpp
+@@ -158,8 +158,9 @@ struct TypedPacketEvent : Event {
+ 
+ 
+ struct EventPolicies {
+-    static Type get_event(const Event& e) { return e.type; }
+-    static bool can_continue_invoking(const Event& e) { return !e.canceled; }
++    // eventpp discovers these hooks by their exact API names.
++    static Type getEvent(const Event& e) { return e.type; }
++    static bool canContinueInvoking(const Event& e) { return !e.canceled; }
+ };
+ 
+ using BaseDispatcher = eventpp::EventDispatcher<
+diff --git a/src/main.cpp b/src/main.cpp
+index 2681c74..24fbf33 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,73 +1,36 @@
+-#include <csignal>
+-#include <spdlog/spdlog.h>
++#include <chrono>
++#include <iostream>
++#include <memory>
++#include <string_view>
++#include <spdlog/sinks/stdout_color_sinks.h>
+ 
+ #include "core/core.hpp"
+-#include "core/logger.hpp"
++#include "core/probe_sink.hpp"
+ 
+-std::unique_ptr<core::Core> g_core{ nullptr };
+-
+-void signal_handler(int signal)
+-{
+-    if (!g_core) {
+-        return;
+-    }
+-
+-    spdlog::info("Interrupted by signal {}, stopping...", signal);
+-    g_core->stop();
+-}
+-
+-int main()
++int main(int argc, char** argv)
+ {
+-try {
+-        core::Logger logger{};
+-
+-        std::vector<spdlog::sink_ptr> sinks{
+-            core::Logger::create_console_sink(),
+-            core::Logger::create_file_sink()
+-        };
+-
+-        logger.set_logger(std::make_shared<spdlog::logger>("GTProxy", sinks.begin(), sinks.end()));
+-        logger.get_logger()->set_level(spdlog::level::trace);
+-
+-        spdlog::register_logger(logger.get_logger());
+-        spdlog::set_default_logger(logger.get_logger());
+-        spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%t] [%^%l%$] %v");
++    if (argc != 2 || std::string_view{ argv[1] } != "--offline-smoke-test") {
++        std::cerr << "Offline readiness build. Use --offline-smoke-test for a bounded local check.\n";
++        return 2;
+     }
+-    catch (const spdlog::spdlog_ex& ex) {
+-        spdlog::error("Log initialization failed: {}", ex.what());
+-        return 1;
+-    }
+-
+     try {
+-        spdlog::info(
+-            "Starting GTProxy (v{}.{}.{}{})",
+-            GTPROXY_VERSION_MAJOR,
+-            GTPROXY_VERSION_MINOR,
+-            GTPROXY_VERSION_PATCH,
+-#ifdef GTPROXY_BUILD_VERSION
+-            fmt::format!("-{}", GTPROXY_BUILD_VERSION)
+-#else
+-            ""
+-#endif
+-        );
+-
+-        g_core = std::make_unique<core::Core>();
+-
+-        std::signal(SIGINT, signal_handler);
+-        std::signal(SIGTERM, signal_handler);
+-
+-        g_core->run();
+-    }
+-    catch (const std::runtime_error& e) {
+-        spdlog::error("Runtime error: {}", e.what());
+-        return 1;
+-    }
+-    catch (const std::exception& ex) {
+-        spdlog::error("Exception: {}", ex.what());
++        auto console = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
++        console->set_pattern("[%l] %v");
++        auto filter = std::make_shared<core::ProbeSink>(console);
++        auto logger = std::make_shared<spdlog::logger>("marvprox-probe", filter);
++        logger->set_level(spdlog::level::trace);
++        spdlog::set_default_logger(logger);
++        core::emit_probe_event(core::ProbeEvent::Starting);
++        {
++            core::Core runtime;
++            core::emit_probe_event(core::ProbeEvent::Ready);
++            runtime.run_for(std::chrono::milliseconds{ 1000 });
++        }
++        core::emit_probe_event(core::ProbeEvent::Stopped);
++        spdlog::shutdown();
++        return 0;
++    } catch (...) {
++        core::emit_probe_event(core::ProbeEvent::StartupFailed);
+         return 1;
+     }
+-
+-    spdlog::info("GTProxy stopped");
+-    spdlog::shutdown();
+-    return 0;
+ }
+diff --git a/src/network/client.cpp b/src/network/client.cpp
+index 946efc4..d6880a1 100644
+--- a/src/network/client.cpp
++++ b/src/network/client.cpp
+@@ -1,4 +1,6 @@
+ #include "client.hpp"
++#include "probe_host.hpp"
++#include "../core/probe_policy.hpp"
+ 
+ #include <stdexcept>
+ #include <spdlog/spdlog.h>
+@@ -22,24 +24,12 @@ Client::Client(core::Config& config, event::Dispatcher& dispatcher)
+ 
+ ENetHost* Client::create_host()
+ {
+-    ENetHost* host{ enet_host_create(nullptr, 1, 2, 0, 0) };
+-    if (!host) {
+-        return nullptr;
+-    }
+-
+-    if (enet_host_compress_with_range_coder(host) != 0) {
+-        enet_host_destroy(host);
+-        return nullptr;
+-    }
+-
+-    host->checksum = enet_crc32;
+-    host->usingNewPacket = 1;
+-
+-    return host;
++    return create_probe_client_host();
+ }
+ 
+ bool Client::connect(const std::string& host, std::uint16_t port)
+ {
++    if (!core::ProbePolicy::allow_upstream_connections()) return false;
+     if (!host_) {
+         return false;
+     }
+diff --git a/src/network/enet_runtime.hpp b/src/network/enet_runtime.hpp
+new file mode 100644
+index 0000000..f71e3fe
+--- /dev/null
++++ b/src/network/enet_runtime.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++#include <stdexcept>
++#include <enet/enet.h>
++
++namespace network {
++class ENetRuntime final {
++public:
++    ENetRuntime()
++    {
++        if (enet_initialize() != 0) throw std::runtime_error{ "Probe network initialization failed" };
++    }
++    ~ENetRuntime() { enet_deinitialize(); }
++    ENetRuntime(const ENetRuntime&) = delete;
++    ENetRuntime& operator=(const ENetRuntime&) = delete;
++};
++}
+diff --git a/src/network/probe_host.cpp b/src/network/probe_host.cpp
+new file mode 100644
+index 0000000..9dbda3b
+--- /dev/null
++++ b/src/network/probe_host.cpp
+@@ -0,0 +1,25 @@
++#include "probe_host.hpp"
++#include "../core/probe_policy.hpp"
++
++namespace network {
++namespace {
++ENetHost* create_host(std::uint16_t port, bool server)
++{
++    ENetAddress address{};
++    if (enet_address_set_host_ip(&address, core::ProbePolicy::listen_address()) != 0) return nullptr;
++    address.port = port;
++    auto* host = enet_host_create(&address, 1, 2, 0, 0);
++    if (!host) return nullptr;
++    if (enet_host_compress_with_range_coder(host) != 0) {
++        enet_host_destroy(host);
++        return nullptr;
++    }
++    host->checksum = enet_crc32;
++    if (server) host->usingNewPacketForServer = 1;
++    else host->usingNewPacket = 1;
++    return host;
++}
++}
++ENetHost* create_probe_server_host(std::uint16_t port) { return create_host(port, true); }
++ENetHost* create_probe_client_host() { return create_host(0, false); }
++}
+diff --git a/src/network/probe_host.hpp b/src/network/probe_host.hpp
+new file mode 100644
+index 0000000..54c6071
+--- /dev/null
++++ b/src/network/probe_host.hpp
+@@ -0,0 +1,8 @@
++#pragma once
++#include <cstdint>
++#include <enet/enet.h>
++
++namespace network {
++[[nodiscard]] ENetHost* create_probe_server_host(std::uint16_t port);
++[[nodiscard]] ENetHost* create_probe_client_host();
++}
+diff --git a/src/network/server.cpp b/src/network/server.cpp
+index 73543ad..3077b47 100644
+--- a/src/network/server.cpp
++++ b/src/network/server.cpp
+@@ -1,4 +1,5 @@
+ #include "server.hpp"
++#include "probe_host.hpp"
+ 
+ #include <stdexcept>
+ #include <spdlog/spdlog.h>
+@@ -27,24 +28,7 @@ Server::Server(core::Config& config, event::Dispatcher& dispatcher)
+ 
+ ENetHost* Server::create_host(std::uint16_t port)
+ {
+-    ENetAddress address{};
+-    address.host = ENET_HOST_ANY;
+-    address.port = port;
+-
+-    ENetHost* host{ enet_host_create(&address, 1, 2, 0, 0) };
+-    if (!host) {
+-        return nullptr;
+-    }
+-
+-    if (enet_host_compress_with_range_coder(host) != 0) {
+-        enet_host_destroy(host);
+-        return nullptr;
+-    }
+-
+-    host->checksum = enet_crc32;
+-    host->usingNewPacketForServer = 1;
+-
+-    return host;
++    return create_probe_server_host(port);
+ }
+ 
+ void Server::on_connect(ENetPeer* peer)
+diff --git a/src/scripting/script_event_bridge.cpp b/src/scripting/script_event_bridge.cpp
+index a131e16..19e98d7 100644
+--- a/src/scripting/script_event_bridge.cpp
++++ b/src/scripting/script_event_bridge.cpp
+@@ -118,7 +118,7 @@ ScriptEventBridge::ScriptEventBridge(
+ ScriptEventBridge::~ScriptEventBridge()
+ {
+     for (auto& [type, handle] : event_handles_) {
+-        dispatcher_.removeListener(type, handle);
++        dispatcher_.remove_listener(type, handle);
+     }
+ }
+ 
+@@ -220,7 +220,7 @@ void ScriptEventBridge::setup_event_listeners()
+     for (const auto type : event_values) {
+         if (type == event::Type::Max) continue;
+ 
+-        event_handles_[type] = dispatcher_.appendListener(
++        event_handles_[type] = dispatcher_.append_listener(
+             type,
+             make_handler(type),
+             event::Priority::FairlyHigh
+@@ -229,7 +229,7 @@ void ScriptEventBridge::setup_event_listeners()
+ 
+     for (const auto& [name, pid] : PACKET_ID_MAP) {
+         const auto type = event::packet_event_type(pid);
+-        event_handles_[type] = dispatcher_.appendListener(
++        event_handles_[type] = dispatcher_.append_listener(
+             type,
+             make_handler(type),
+             event::Priority::FairlyHigh
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 5d7e8ff..f7207d4 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -3,13 +3,18 @@ project(GTProxy_tests)
+ find_package(GTest REQUIRED)
+ 
+ add_executable(GTProxy_tests
++    core/test_probe_policy.cpp
++    core/test_forwarding.cpp
++    core/test_dispatcher.cpp
++    core/test_verified_tls.cpp
++    core/test_startup.cpp
+     utils/test_text_parse.cpp
+     utils/test_byte_stream.cpp)
+ 
+ target_include_directories(GTProxy_tests PRIVATE
+     ${CMAKE_SOURCE_DIR}/src)
+ 
+-target_link_libraries(GTProxy_tests PRIVATE GTest::gtest_main)
++target_link_libraries(GTProxy_tests PRIVATE GTest::gtest_main GTProxy_core)
+ 
+ include(GoogleTest)
+-gtest_discover_tests(GTProxy_tests)
++gtest_discover_tests(GTProxy_tests PROPERTIES TIMEOUT 20)
+diff --git a/tests/core/test_dispatcher.cpp b/tests/core/test_dispatcher.cpp
+new file mode 100644
+index 0000000..94e9cec
+--- /dev/null
++++ b/tests/core/test_dispatcher.cpp
+@@ -0,0 +1,17 @@
++#include <gtest/gtest.h>
++#include "event/event.hpp"
++
++TEST(ProbeDispatch, DeliversEventAndHonorsCancellation)
++{
++    event::Dispatcher dispatcher;
++    int first{};
++    int later{};
++    dispatcher.append_listener(event::Type::ClientConnect, [&](const event::Event& incoming) {
++        ++first;
++        incoming.cancel();
++    });
++    dispatcher.append_listener(event::Type::ClientConnect, [&](const event::Event&) { ++later; });
++    dispatcher.dispatch(event::ConnectionEvent{ event::Type::ClientConnect });
++    EXPECT_EQ(first, 1);
++    EXPECT_EQ(later, 0);
++}
+diff --git a/tests/core/test_forwarding.cpp b/tests/core/test_forwarding.cpp
+new file mode 100644
+index 0000000..296f147
+--- /dev/null
++++ b/tests/core/test_forwarding.cpp
+@@ -0,0 +1,34 @@
++#include <gtest/gtest.h>
++#include "core/handlers/forwarding_handler.hpp"
++#include "network/connection.hpp"
++#include "packet/packet_decoder.hpp"
++
++class RecordingConnection final : public network::IConnection {
++public:
++    mutable std::vector<std::vector<std::byte>> sent;
++    bool write(std::span<const std::byte> data, int = 0) const override
++    {
++        sent.emplace_back(data.begin(), data.end());
++        return true;
++    }
++    bool write(const std::vector<std::byte>& data, int channel = 0) const override
++    {
++        return write(std::span{ data }, channel);
++    }
++    bool is_connected() const override { return true; }
++};
++
++TEST(ProbeForwarding, UnknownPacketsAreForwardedWithoutRewriting)
++{
++    event::Dispatcher dispatcher;
++    RecordingConnection client;
++    RecordingConnection server;
++    core::handlers::ForwardingHandler forwarding{ dispatcher, client, server };
++    const std::vector<std::byte> bytes{ std::byte{ 0xfe }, std::byte{ 0xfe }, std::byte{ 0xfe }, std::byte{ 0xfe }, std::byte{ 0xab } };
++    EXPECT_FALSE(packet::PacketDecoder::decode(bytes, core::Config::LogConfig{}, "ServerBound").has_value());
++    dispatcher.dispatch(event::RawPacketEvent{ event::Type::ServerBoundPacket, bytes });
++    EXPECT_EQ(client.sent, (std::vector<std::vector<std::byte>>{ bytes }));
++    EXPECT_TRUE(server.sent.empty());
++    dispatcher.dispatch(event::RawPacketEvent{ event::Type::ClientBoundPacket, bytes });
++    EXPECT_EQ(server.sent, (std::vector<std::vector<std::byte>>{ bytes }));
++}
+diff --git a/tests/core/test_probe_policy.cpp b/tests/core/test_probe_policy.cpp
+new file mode 100644
+index 0000000..8d9fdb5
+--- /dev/null
++++ b/tests/core/test_probe_policy.cpp
+@@ -0,0 +1,95 @@
++#include <gtest/gtest.h>
++#include <sstream>
++#include <spdlog/sinks/ostream_sink.h>
++#include <spdlog/spdlog.h>
++
++#include "core/probe_policy.hpp"
++#include "core/core.hpp"
++#include "core/probe_sink.hpp"
++#include "network/probe_host.hpp"
++#include "network/client.hpp"
++#include "packet/packet_decoder.hpp"
++#include "test_workspace.hpp"
++
++TEST(ProbePolicy, CommandsStayDisabledWithExistingConfig)
++{
++    TestWorkspace workspace;
++    core::Config legacy;
++    int commands{};
++    int scripts{};
++    core::ProbePolicy::initialize_extensions([&] { ++commands; }, [&] { ++scripts; });
++    EXPECT_EQ(commands, 0);
++    EXPECT_EQ(scripts, 0);
++    EXPECT_FALSE(legacy.get_log_config().print_message);
++    EXPECT_FALSE(legacy.get_log_config().print_extra);
++}
++
++TEST(ProbePolicy, ScriptsAreNotLoaded)
++{
++    bool script_executed{};
++    core::ProbePolicy::initialize_extensions([] {}, [&] { script_executed = true; });
++    EXPECT_FALSE(script_executed);
++}
++
++TEST(ProbePolicy, HeadersBodiesAndPacketsDoNotReachLogs)
++{
++    std::ostringstream output;
++    auto destination = std::make_shared<spdlog::sinks::ostream_sink_mt>(output);
++    destination->set_pattern("%v");
++    auto filter = std::make_shared<core::ProbeSink>(destination);
++    auto logger = std::make_shared<spdlog::logger>("probe-test", filter);
++    const auto previous = spdlog::default_logger();
++    spdlog::set_default_logger(logger);
++    struct RestoreLogger {
++        std::shared_ptr<spdlog::logger> saved;
++        ~RestoreLogger() { spdlog::set_default_logger(saved); }
++    } restore{ previous };
++    TestWorkspace workspace;
++    workspace.certificates();
++    const int web_port = available_test_port();
++    workspace.configure(web_port);
++    {
++        core::Core runtime;
++        httplib::SSLClient client{ "127.0.0.1", web_port };
++        const auto root = std::filesystem::path{ std::getenv("MARVPROX_TEST_CERT_DIR") };
++        client.set_ca_cert_path((root / "cert.pem").string());
++        client.set_connection_timeout(3, 0);
++        client.set_read_timeout(3, 0);
++        const auto result = client.Post("/growtopia/server_data.php",
++            httplib::Headers{ { "Authorization", "SYNTHETIC_HEADER_SECRET" } },
++            "password=SYNTHETIC_BODY_SECRET", "application/x-www-form-urlencoded");
++        ASSERT_TRUE(result);
++        EXPECT_EQ(result->status, 503);
++        EXPECT_EQ(result->body, "Offline probe: upstream connections are disabled");
++        const auto path = client.Get("/SYNTHETIC_PATH_SECRET");
++        ASSERT_TRUE(path);
++        EXPECT_EQ(path->status, 404);
++    }
++    const std::string message{ "password|SYNTHETIC_PACKET_SECRET\n" };
++    std::vector<std::byte> payload{ std::byte{ 2 }, std::byte{ 0 }, std::byte{ 0 }, std::byte{ 0 } };
++    for (const char ch : message) payload.push_back(static_cast<std::byte>(ch));
++    payload.push_back(std::byte{ 0 });
++    core::Config::LogConfig legacy{ true, true, true, true };
++    std::ignore = packet::PacketDecoder::decode(payload, legacy, "ServerBound");
++    core::emit_probe_event(core::ProbeEvent::Ready);
++    logger->flush();
++    EXPECT_EQ(output.str().find("SYNTHETIC_"), std::string::npos);
++    EXPECT_NE(output.str().find("probe.ready"), std::string::npos);
++    EXPECT_EQ(output.str().find("probe.ready"), output.str().rfind("probe.ready"));
++    auto normalized = output.str();
++    std::erase(normalized, '\r');
++    EXPECT_EQ(normalized, "probe.ready\n");
++}
++
++TEST(ProbePolicy, ListenersBindOnlyLoopback)
++{
++    ASSERT_EQ(enet_initialize(), 0);
++    auto* host = network::create_probe_server_host(0);
++    ASSERT_NE(host, nullptr);
++    char address[64]{};
++    EXPECT_EQ(enet_address_get_host_ip(&host->address, address, sizeof(address)), 0);
++    EXPECT_STREQ(address, "127.0.0.1");
++    EXPECT_NE(host->address.port, 0);
++    enet_host_destroy(host);
++    enet_deinitialize();
++}
+diff --git a/tests/core/test_startup.cpp b/tests/core/test_startup.cpp
+new file mode 100644
+index 0000000..ed36eeb
+--- /dev/null
++++ b/tests/core/test_startup.cpp
+@@ -0,0 +1,94 @@
++#include <gtest/gtest.h>
++#include "core/core.hpp"
++#include "network/probe_host.hpp"
++#include "test_workspace.hpp"
++
++namespace {
++int available_udp_port()
++{
++    network::ENetRuntime runtime;
++    auto* host = network::create_probe_server_host(0);
++    if (!host) throw std::runtime_error{ "UDP fixture allocation failed" };
++    const int port = host->address.port;
++    enet_host_destroy(host);
++    return port;
++}
++void expect_udp_released(int port)
++{
++    network::ENetRuntime runtime;
++    auto* host = network::create_probe_server_host(static_cast<std::uint16_t>(port));
++    EXPECT_NE(host, nullptr) << "Failed startup retained its UDP socket";
++    if (host) enet_host_destroy(host);
++}
++template<class Start> void expect_failure(Start start, const std::string& expected)
++{
++    try { start(); FAIL() << "Startup unexpectedly succeeded"; }
++    catch (const std::exception& error) { EXPECT_EQ(error.what(), expected); }
++}
++void expect_corrected_startup(TestWorkspace& workspace, int web_port, int udp_port)
++{
++    workspace.certificates();
++    workspace.configure(web_port, udp_port);
++    core::Core corrected;
++    corrected.run_for(std::chrono::milliseconds{ 10 });
++}
++}
++
++TEST(ProbeStartup, MissingCertificateFailsWithoutTerminating)
++{
++    TestWorkspace workspace;
++    const int udp_port = available_udp_port();
++    workspace.configure(0, udp_port);
++    expect_failure([] { core::Core runtime; }, "Probe TLS certificate unavailable");
++    expect_udp_released(udp_port);
++    expect_corrected_startup(workspace, 0, udp_port);
++}
++
++TEST(ProbeStartup, OccupiedPortFailsWithoutTerminating)
++{
++    TestWorkspace workspace;
++    workspace.certificates();
++    const int udp_port = available_udp_port();
++    int web_port{};
++    {
++        network::ENetRuntime networking;
++        ENetAddress address{};
++        ASSERT_EQ(enet_address_set_host_ip(&address, "127.0.0.1"), 0);
++        const auto socket = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
++        ASSERT_NE(socket, ENET_SOCKET_NULL);
++        ASSERT_EQ(enet_socket_bind(socket, &address), 0);
++        ASSERT_EQ(enet_socket_listen(socket, 1), 0);
++        ASSERT_EQ(enet_socket_get_address(socket, &address), 0);
++        web_port = address.port;
++        workspace.configure(web_port, udp_port);
++        expect_failure([] { core::Core runtime; }, "Probe HTTPS port unavailable");
++        expect_udp_released(udp_port);
++        enet_socket_destroy(socket);
++    }
++    expect_corrected_startup(workspace, web_port, udp_port);
++}
++
++TEST(ProbeStartup, FailureAfterHttpsStartReleasesSocketsAndAllowsRestart)
++{
++    TestWorkspace workspace;
++    workspace.certificates();
++    const int web_port = available_test_port();
++    const int udp_port = available_udp_port();
++    workspace.configure(web_port, udp_port);
++    expect_failure([] {
++        core::Core runtime{ [] { throw std::runtime_error{ "Controlled post-listener failure" }; } };
++    }, "Controlled post-listener failure");
++    expect_udp_released(udp_port);
++    expect_corrected_startup(workspace, web_port, udp_port);
++}
++
++TEST(ProbeStartup, RepeatedStartupAndShutdownReleasesPorts)
++{
++    TestWorkspace workspace;
++    const int web_port = available_test_port();
++    const int udp_port = available_udp_port();
++    for (int attempt = 0; attempt < 3; ++attempt) {
++        expect_corrected_startup(workspace, web_port, udp_port);
++        expect_udp_released(udp_port);
++    }
++}
+diff --git a/tests/core/test_verified_tls.cpp b/tests/core/test_verified_tls.cpp
+new file mode 100644
+index 0000000..e4c2dad
+--- /dev/null
++++ b/tests/core/test_verified_tls.cpp
+@@ -0,0 +1,31 @@
++#include <gtest/gtest.h>
++#include <cstdlib>
++#include <filesystem>
++#include <thread>
++#include "core/verified_upstream.hpp"
++
++TEST(ProbeTls, RejectsAnUntrustedServerCertificate)
++{
++    const char* directory = std::getenv("MARVPROX_TEST_CERT_DIR");
++    ASSERT_NE(directory, nullptr) << "Generate a disposable local test certificate before running this test";
++    const auto root = std::filesystem::path{ directory };
++    httplib::SSLServer server{ (root / "cert.pem").string().c_str(), (root / "key.pem").string().c_str() };
++    ASSERT_TRUE(server.is_valid());
++    server.Get("/", [](const httplib::Request&, httplib::Response& response) { response.set_content("local fixture", "text/plain"); });
++    const int port = server.bind_to_any_port("127.0.0.1");
++    ASSERT_GT(port, 0);
++    std::thread listener{ [&] { server.listen_after_bind(); } };
++    httplib::SSLClient trusted{ "127.0.0.1", port };
++    trusted.set_ca_cert_path((root / "cert.pem").string());
++    trusted.set_connection_timeout(3, 0);
++    trusted.set_read_timeout(3, 0);
++    const auto positive = trusted.Get("/");
++    auto client = core::make_verified_upstream("127.0.0.1", port);
++    const auto result = client->Get("/");
++    server.stop();
++    listener.join();
++    EXPECT_TRUE(positive) << "The same fixture must work when its CA is trusted for this client only";
++    if (positive) EXPECT_EQ(positive->body, "local fixture");
++    EXPECT_FALSE(result) << "An untrusted self-signed certificate must fail verification";
++    EXPECT_EQ(result.error(), httplib::Error::SSLServerVerification);
++}
+diff --git a/tests/core/test_workspace.hpp b/tests/core/test_workspace.hpp
+new file mode 100644
+index 0000000..ddde530
+--- /dev/null
++++ b/tests/core/test_workspace.hpp
+@@ -0,0 +1,61 @@
++#pragma once
++#include <chrono>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <stdexcept>
++#include <enet/enet.h>
++
++class TestWorkspace {
++public:
++    TestWorkspace() : previous_{ std::filesystem::current_path() }
++    {
++        directory_ = std::filesystem::temp_directory_path() / ("marvprox-probe-" +
++            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(std::random_device{}()));
++        if (!std::filesystem::create_directory(directory_)) throw std::runtime_error{ "Test workspace collision" };
++        std::filesystem::current_path(directory_);
++        configure(0);
++    }
++    ~TestWorkspace()
++    {
++        std::error_code error;
++        std::filesystem::current_path(previous_, error);
++        std::filesystem::remove_all(directory_, error);
++    }
++    void configure(int web_port, int udp_port = 0)
++    {
++        std::ofstream config{ "config.json" };
++        config << "{\"server\":{\"port\":" << udp_port << ",\"web_port\":" << web_port << "},\"log\":{\"print_message\":true,\"print_game_update_packet\":true,\"print_variant\":true,\"print_extra\":true}}";
++        if (!config) throw std::runtime_error{ "Test config write failed" };
++    }
++    void certificates()
++    {
++        const auto* input = std::getenv("MARVPROX_TEST_CERT_DIR");
++        if (!input) throw std::runtime_error{ "Disposable test certificate is required" };
++        std::filesystem::create_directory("resources");
++        for (const auto* name : { "cert.pem", "key.pem" }) {
++            std::filesystem::copy_file(std::filesystem::path{ input } / name,
++                std::filesystem::path{ "resources" } / name, std::filesystem::copy_options::overwrite_existing);
++        }
++    }
++private:
++    std::filesystem::path previous_;
++    std::filesystem::path directory_;
++};
++
++inline int available_test_port()
++{
++    if (enet_initialize() != 0) throw std::runtime_error{ "Test network initialization failed" };
++    ENetAddress address{};
++    enet_address_set_host_ip(&address, "127.0.0.1");
++    const auto socket = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
++    if (socket == ENET_SOCKET_NULL || enet_socket_bind(socket, &address) != 0 || enet_socket_get_address(socket, &address) != 0) {
++        if (socket != ENET_SOCKET_NULL) enet_socket_destroy(socket);
++        enet_deinitialize();
++        throw std::runtime_error{ "Test port allocation failed" };
++    }
++    enet_socket_destroy(socket);
++    enet_deinitialize();
++    return address.port;
++}

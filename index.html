@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>MarvProx — Inventory Menu Demo</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="src/inventory.js"></script>
+  <script defer src="src/operation.js"></script>
+  <script defer src="src/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#inventory">Skip to inventory</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Workspace">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">m.</span><span>MarvProx<span class="brand-caption">INVENTORY WORKSPACE</span></span></div>
+      <p class="sidebar-label">WORKSPACE</p>
+      <a class="nav-item" href="#inventory" aria-current="page"><span aria-hidden="true">▦</span> Inventory <span class="nav-count" id="nav-count">8</span></a>
+      <div class="sidebar-note"><span class="status-dot" aria-hidden="true"></span> Local demo<span>Sample items only.<br>No account connection.</span></div>
+      <div class="sidebar-footer">MADE FOR A LITTLE MORE CONTROL.<br><span>MarvProx · Prototype 01</span></div>
+    </aside>
+
+    <main>
+      <div class="topbar"><span>Workspace <span class="separator">/</span> <strong>Inventory</strong></span><span class="demo-pill"><span class="status-dot" aria-hidden="true"></span> LOCAL DEMO</span></div>
+      <header class="page-heading"><div><p class="eyebrow">YOUR ITEMS. YOUR CALL.</p><h1>Inventory drop menu<span>.</span></h1><p>Choose what stays. Preview everything before you confirm.</p></div><span class="version-tag">PROTOTYPE / 01</span></header>
+
+      <div class="simulation-banner" id="simulation-banner"><span class="banner-icon" aria-hidden="true">i</span><div><strong>Simulation mode — not connected to Growtopia</strong><p>These are sample items. Nothing you do here moves real items.</p></div><span class="banner-tag">OFFLINE</span></div>
+
+      <div class="workspace-grid">
+        <section class="inventory-panel" id="inventory" aria-labelledby="inventory-heading" tabindex="-1">
+          <div class="section-heading"><div><h2 id="inventory-heading">Your inventory <span id="stack-count" class="count-chip">8 stacks</span></h2><p>Uncheck an item to keep it.</p></div><span class="safety-tag">◆ Protection on</span></div>
+          <div class="inventory-grid" id="inventory-grid"></div>
+          <p class="inventory-footnote"><span aria-hidden="true">◆</span> Locks, equipped items, and unidentified items are always protected in this demo.</p>
+          <noscript><p>Enable JavaScript to use this local sample menu.</p></noscript>
+        </section>
+
+        <aside class="action-panel" aria-label="Drop controls">
+          <section class="summary-card" aria-labelledby="summary-heading"><div class="card-eyebrow"><span class="status-dot" aria-hidden="true"></span> SELECTION SUMMARY</div><h2 id="summary-heading">Ready when you are.</h2><p>Only eligible, selected items will be included.</p><div class="selection-total"><strong id="selected-quantity">297</strong><span>sample items selected</span></div><dl class="selection-details"><div><dt>Selected stacks</dt><dd id="selected-stacks">5</dd></div><div><dt>Protected stacks</dt><dd id="protected-stacks">3</dd></div><div><dt>Excluded stacks</dt><dd id="excluded-stacks">0</dd></div></dl><button class="button primary" id="preview-button" type="button" disabled>Preview Drop All <span aria-hidden="true">↗</span></button><button class="button secondary" id="reset-button" type="button">Reset Sample Inventory</button><p class="button-note">You’ll review the exact list before confirming.</p></section>
+          <section class="stop-card"><div><h3>A stop button, always.</h3><p>Stop prevents the next action. An action already in progress may finish.</p></div><button class="button stop-button" id="stop-button" type="button" disabled>Stop</button></section>
+        </aside>
+
+        <section class="activity-panel" aria-labelledby="activity-heading"><div class="section-heading"><div><p class="eyebrow">EVERY ACTION, ACCOUNTED FOR</p><h2 id="activity-heading">Operation activity</h2></div><span id="operation-status" class="operation-status" role="status" data-status="idle">Ready</span></div><p id="operation-message" class="activity-message">Preview your selection to get started.</p><progress id="operation-progress" max="1" value="0" aria-label="Simulated drop progress"></progress><div class="activity-columns"><section><h3><span class="activity-dot success" aria-hidden="true"></span> Completed <span id="completed-count">0</span></h3><ul id="completed-list"><li class="empty-list">No completed actions yet.</li></ul></section><section><h3><span class="activity-dot skipped" aria-hidden="true"></span> Skipped <span id="skipped-count">0</span></h3><ul id="skipped-list"><li class="empty-list">Protected and excluded items appear here.</li></ul></section><section><h3><span class="activity-dot failed" aria-hidden="true"></span> Failed <span id="failed-count">0</span></h3><ul id="failed-list"><li class="empty-list">No failed actions.</li></ul></section></div></section>
+      </div>
+      <p class="app-footer">Built for a deliberate preview, a clear choice, and a visible result.<span>LOCAL SAMPLE INVENTORY</span></p>
+    </main>
+  </div>
+
+  <dialog id="preview-dialog" aria-labelledby="preview-title" aria-describedby="preview-description"><div class="dialog-heading"><p class="eyebrow">ONE LAST LOOK</p><h2 id="preview-title">Review your drop list.</h2><p id="preview-description">Only sample items will be removed. Your real inventory is not connected.</p></div><ul id="preview-items" class="preview-items"></ul><p id="preview-total" class="preview-total"></p><p class="dialog-note">Protected and excluded items stay in your inventory. Stop cannot undo a completed action.</p><div class="dialog-actions"><button class="button secondary" id="cancel-button" type="button" autofocus>Cancel</button><button class="button primary" id="confirm-button" type="button">Confirm simulated drop</button></div></dialog>
+</body>
+</html>

@@ -1,0 +1,4 @@
+# Unified patches contain required context prefixes and untouched upstream whitespace.
+proxy/patches/*.patch -whitespace
+
+*.cmd text eol=crlf
